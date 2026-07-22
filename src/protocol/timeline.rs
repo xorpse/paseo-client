@@ -16,10 +16,16 @@ pub struct ToolCallDetail {
     pub unified_diff: Option<String>,
     #[serde(rename = "filePath", default)]
     pub file_path: Option<String>,
+    #[serde(rename = "oldString", default)]
+    pub old_string: Option<String>,
+    #[serde(rename = "newString", default)]
+    pub new_string: Option<String>,
     #[serde(default)]
     pub content: Option<String>,
     #[serde(default)]
     pub query: Option<String>,
+    #[serde(rename = "filePaths", default)]
+    pub file_paths: Option<Vec<String>>,
     #[serde(default)]
     pub url: Option<String>,
     #[serde(default)]
