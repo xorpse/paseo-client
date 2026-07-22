@@ -1,6 +1,7 @@
 pub mod agents;
 pub mod diff;
 pub mod stream;
+pub mod subagents;
 pub mod terminals;
 pub mod timeline;
 pub mod workspaces;
@@ -11,6 +12,7 @@ pub use agents::{AgentListEntry, AgentSnapshot, PermissionRequest, PermissionRes
 use serde::Deserialize;
 use serde_json::Value;
 pub use stream::{AgentStreamEvent, AgentUpdate};
+pub use subagents::{ProviderSubagent, SubagentUpdate};
 pub use terminals::TerminalInfo;
 pub use timeline::{TimelineItem, ToolCallDetail};
 

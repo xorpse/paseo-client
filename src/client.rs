@@ -16,7 +16,7 @@ use crate::offer::{build_relay_ws_url, decode_daemon_public_key, ConnectionOffer
 use crate::protocol::agents::{AgentListEntry, PermissionResponse};
 use crate::protocol::stream::{AgentStreamEvent, AgentUpdate};
 use crate::protocol::terminals::{self, CreateTerminalOpts, TerminalInfo};
-use crate::protocol::{agents, diff, ServerInfo};
+use crate::protocol::{agents, diff, subagents, ServerInfo};
 use crate::transport::{Frame, Transport, WsTransport};
 
 fn new_id() -> String {
@@ -224,6 +224,37 @@ impl PaseoClient {
             cursor.as_ref(),
         ))
         .await
+    }
+
+    pub async fn list_provider_subagents(
+        &self,
+        parent_agent_id: &str,
+    ) -> Result<Vec<crate::protocol::subagents::ProviderSubagent>> {
+        let id = new_id();
+        let payload = self
+            .request(subagents::list_request(&id, parent_agent_id))
+            .await?;
+        Ok(subagents::parse_list(&payload))
+    }
+
+    pub async fn fetch_provider_subagent_timeline(
+        &self,
+        parent_agent_id: &str,
+        subagent_id: &str,
+        direction: &str,
+        limit: u32,
+    ) -> Result<Vec<crate::protocol::TimelineItem>> {
+        let id = new_id();
+        let payload = self
+            .request(subagents::timeline_request(
+                &id,
+                parent_agent_id,
+                subagent_id,
+                direction,
+                limit,
+            ))
+            .await?;
+        Ok(subagents::parse_timeline(&payload))
     }
 
     pub async fn subscribe_agents(&self) -> Result<()> {
@@ -809,6 +840,11 @@ impl PaseoClient {
                         self.inner.terminals.lock().remove(&slot);
                     }
                     self.emit(DaemonEvent::TerminalExit(terminal_id.to_owned()));
+                }
+            }
+            "agent.provider_subagents.update" => {
+                if let Some(update) = subagents::parse_update(&payload) {
+                    self.emit(DaemonEvent::Subagent(Box::new(update)));
                 }
             }
             "checkout_diff_update" => {

@@ -1,7 +1,9 @@
 use serde_json::Value;
 
 use crate::protocol::diff::CheckoutDiff;
-use crate::protocol::{AgentSnapshot, AgentStreamEvent, PermissionRequest, TerminalInfo};
+use crate::protocol::{
+    AgentSnapshot, AgentStreamEvent, PermissionRequest, SubagentUpdate, TerminalInfo,
+};
 
 #[derive(Clone, Debug)]
 pub enum ConnectionState {
@@ -35,5 +37,6 @@ pub enum DaemonEvent {
     },
     TerminalExit(String),
     CheckoutDiff(Box<CheckoutDiff>),
+    Subagent(Box<SubagentUpdate>),
     Disconnected,
 }

@@ -18,6 +18,7 @@ pub use protocol::agents::{
 };
 pub use protocol::diff::{CheckoutDiff, CheckoutStatus, DiffFile, DiffHunk, DiffLine};
 pub use protocol::stream::AgentStreamEvent;
+pub use protocol::subagents::{ProviderSubagent, SubagentUpdate};
 pub use protocol::terminals::CreateTerminalOpts;
 pub use protocol::timeline::{TimelineItem, ToolCallDetail};
 pub use protocol::workspaces::Workspace;
