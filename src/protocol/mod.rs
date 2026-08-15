@@ -9,9 +9,9 @@ pub mod workspaces;
 use std::collections::HashMap;
 
 pub use agents::{
-    AgentListEntry, AgentPersistenceHandle, AgentSnapshot, ForkAttachment, ForkedContext,
-    ImportAgentRequest, PermissionRequest, PermissionResponse, PromptPreview, RewindMode,
-    WaitOutcome, WaitStatus,
+    AgentListEntry, AgentPersistenceHandle, AgentSnapshot, ForkedContext, ImportAgentRequest,
+    PermissionRequest, PermissionResponse, PromptPreview, RewindMode, TextAttachment, WaitOutcome,
+    WaitStatus,
 };
 use serde::Deserialize;
 use serde_json::Value;

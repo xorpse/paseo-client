@@ -276,17 +276,39 @@ pub struct PromptPreview {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ForkAttachment {
+pub struct TextAttachment {
+    #[serde(default)]
+    pub context_kind: Option<String>,
     #[serde(default)]
     pub title: Option<String>,
     pub text: String,
+}
+
+impl Serialize for TextAttachment {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("type", "text")?;
+        map.serialize_entry("mimeType", "text/plain")?;
+        if let Some(context_kind) = &self.context_kind {
+            map.serialize_entry("contextKind", context_kind)?;
+        }
+        if let Some(title) = &self.title {
+            map.serialize_entry("title", title)?;
+        }
+        map.serialize_entry("text", &self.text)?;
+        map.end()
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ForkedContext {
     #[serde(default)]
-    pub attachment: Option<ForkAttachment>,
+    pub attachment: Option<TextAttachment>,
     #[serde(default)]
     pub item_count: u32,
     #[serde(default)]

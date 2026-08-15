@@ -338,6 +338,7 @@ impl PaseoClient {
         cwd: &str,
         workspace_id: Option<&str>,
         initial_prompt: Option<&str>,
+        attachments: &[agents::TextAttachment],
     ) -> Result<crate::protocol::AgentSnapshot> {
         let id = new_id();
         let mut message = serde_json::json!({
@@ -351,6 +352,9 @@ impl PaseoClient {
         }
         if let Some(initial_prompt) = initial_prompt {
             message["initialPrompt"] = Value::from(initial_prompt);
+        }
+        if !attachments.is_empty() {
+            message["attachments"] = serde_json::to_value(attachments).map_err(PaseoError::from)?;
         }
         let payload = self.request(message).await?;
         match payload.get("status").and_then(Value::as_str) {

@@ -297,7 +297,7 @@ async fn create_agent(client: &PaseoClient, spec: &str) -> anyhow::Result<()> {
     println!("workspace {workspace}");
     println!("creating {provider} agent in {cwd}");
     let snapshot = client
-        .create_agent(provider, cwd, Some(&workspace), prompt.as_deref())
+        .create_agent(provider, cwd, Some(&workspace), prompt.as_deref(), &[])
         .await?;
     println!(
         "created agent {} [{}] provider={} model={:?}",

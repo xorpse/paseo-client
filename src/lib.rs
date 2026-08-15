@@ -13,8 +13,8 @@ pub use error::{PaseoError, Result};
 pub use events::{ConnectionState, DaemonEvent, TerminalStreamEvent};
 pub use offer::{parse_offer_url, ConnectionOffer};
 pub use protocol::agents::{
-    AgentFeature, AgentListEntry, AgentMode, ModelDefinition, PermissionRequest,
-    PermissionResponse, SelectOption, SlashCommand,
+    AgentFeature, AgentListEntry, AgentMode, ForkedContext, ModelDefinition, PermissionRequest,
+    PermissionResponse, SelectOption, SlashCommand, TextAttachment,
 };
 pub use protocol::diff::{CheckoutDiff, CheckoutStatus, DiffFile, DiffHunk, DiffLine};
 pub use protocol::stream::AgentStreamEvent;
