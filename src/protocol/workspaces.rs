@@ -117,11 +117,17 @@ pub fn workspace_create_worktree_request(
     })
 }
 
-pub fn project_github_clone_request(request_id: &str, repo: &str, protocol: &str) -> Value {
+pub fn project_github_clone_request(
+    request_id: &str,
+    repo: &str,
+    protocol: &str,
+    target_directory: &str,
+) -> Value {
     json!({
         "type": "project.github.clone.request",
         "repo": repo,
         "cloneProtocol": protocol,
+        "targetDirectory": target_directory,
         "requestId": request_id
     })
 }

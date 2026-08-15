@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::protocol::timeline::ToolCallDetail;
@@ -111,6 +111,8 @@ pub struct AgentSnapshot {
     pub pending_permissions: Vec<PermissionRequest>,
     #[serde(default)]
     pub features: Vec<AgentFeature>,
+    #[serde(default)]
+    pub persistence: Option<AgentPersistenceHandle>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -192,6 +194,103 @@ impl PermissionResponse {
             }
         }
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentPersistenceHandle {
+    pub provider: String,
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_handle: Option<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub metadata: HashMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportAgentRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_handle_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub labels: HashMap<String, String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum RewindMode {
+    Both,
+    Conversation,
+    Files,
+}
+
+impl RewindMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            RewindMode::Both => "both",
+            RewindMode::Conversation => "conversation",
+            RewindMode::Files => "files",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum WaitStatus {
+    Error,
+    Idle,
+    Permission,
+    Timeout,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WaitOutcome {
+    pub status: WaitStatus,
+    #[serde(default, rename = "final")]
+    pub final_snapshot: Option<AgentSnapshot>,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub last_message: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptPreview {
+    pub seq: u32,
+    #[serde(default)]
+    pub timestamp: String,
+    #[serde(default)]
+    pub preview: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkAttachment {
+    #[serde(default)]
+    pub title: Option<String>,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkedContext {
+    #[serde(default)]
+    pub attachment: Option<ForkAttachment>,
+    #[serde(default)]
+    pub item_count: u32,
+    #[serde(default)]
+    pub boundary_message_id: Option<String>,
 }
 
 pub fn fetch_agents_request(request_id: &str) -> Value {
@@ -360,4 +459,106 @@ pub fn permission_response_message(
         "requestId": request_id,
         "response": response.to_value()
     })
+}
+
+pub fn resume_agent_request(
+    request_id: &str,
+    handle: &AgentPersistenceHandle,
+    overrides: Option<&Value>,
+) -> Value {
+    let mut msg = json!({
+        "type": "resume_agent_request",
+        "handle": serde_json::to_value(handle).expect("persistence handle serialises"),
+        "requestId": request_id
+    });
+    if let Some(overrides) = overrides {
+        msg["overrides"] = overrides.clone();
+    }
+    msg
+}
+
+pub fn import_agent_request(request_id: &str, request: &ImportAgentRequest) -> Value {
+    let mut msg = serde_json::to_value(request).expect("import request serialises");
+    msg["type"] = json!("import_agent_request");
+    msg["requestId"] = json!(request_id);
+    msg
+}
+
+pub fn refresh_agent_request(request_id: &str, agent_id: &str) -> Value {
+    json!({ "type": "refresh_agent_request", "agentId": agent_id, "requestId": request_id })
+}
+
+pub fn update_agent_request(
+    request_id: &str,
+    agent_id: &str,
+    name: Option<&str>,
+    labels: Option<&HashMap<String, String>>,
+) -> Value {
+    let mut msg = json!({
+        "type": "update_agent_request",
+        "agentId": agent_id,
+        "requestId": request_id
+    });
+    if let Some(name) = name {
+        msg["name"] = json!(name);
+    }
+    if let Some(labels) = labels {
+        msg["labels"] = serde_json::to_value(labels).expect("labels serialise");
+    }
+    msg
+}
+
+pub fn detach_agent_request(request_id: &str, agent_id: &str) -> Value {
+    json!({ "type": "agent.detach.request", "agentId": agent_id, "requestId": request_id })
+}
+
+pub fn rewind_agent_request(
+    request_id: &str,
+    agent_id: &str,
+    message_id: &str,
+    mode: RewindMode,
+) -> Value {
+    json!({
+        "type": "agent.rewind.request",
+        "agentId": agent_id,
+        "messageId": message_id,
+        "mode": mode.as_str(),
+        "requestId": request_id
+    })
+}
+
+pub fn wait_for_finish_request(request_id: &str, agent_id: &str, timeout_ms: Option<u32>) -> Value {
+    let mut msg = json!({
+        "type": "wait_for_finish_request",
+        "agentId": agent_id,
+        "requestId": request_id
+    });
+    if let Some(timeout_ms) = timeout_ms {
+        msg["timeoutMs"] = json!(timeout_ms);
+    }
+    msg
+}
+
+pub fn list_prompts_request(request_id: &str, agent_id: &str) -> Value {
+    json!({
+        "type": "agent.timeline.list_prompts.request",
+        "agentId": agent_id,
+        "requestId": request_id
+    })
+}
+
+pub fn fork_context_request(
+    request_id: &str,
+    agent_id: &str,
+    boundary_message_id: Option<&str>,
+) -> Value {
+    let mut msg = json!({
+        "type": "agent.fork_context.request",
+        "agentId": agent_id,
+        "requestId": request_id
+    });
+    if let Some(boundary_message_id) = boundary_message_id {
+        msg["boundaryMessageId"] = json!(boundary_message_id);
+    }
+    msg
 }

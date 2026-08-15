@@ -371,6 +371,137 @@ impl PaseoClient {
         }
     }
 
+    fn resumed_agent(payload: &Value) -> Result<crate::protocol::AgentSnapshot> {
+        match payload.get("status").and_then(Value::as_str) {
+            Some("agent_resumed") => {
+                let agent = payload
+                    .get("agent")
+                    .cloned()
+                    .ok_or_else(|| PaseoError::Protocol("agent_resumed missing agent".into()))?;
+                serde_json::from_value(agent).map_err(PaseoError::from)
+            }
+            _ => Err(PaseoError::Rpc(
+                payload
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("resume failed")
+                    .to_owned(),
+            )),
+        }
+    }
+
+    fn ensure_ok(payload: &Value) -> Result<()> {
+        match payload.get("error").and_then(Value::as_str) {
+            Some(error) if !error.is_empty() => Err(PaseoError::Rpc(error.to_owned())),
+            _ => Ok(()),
+        }
+    }
+
+    pub async fn resume_agent(
+        &self,
+        handle: &agents::AgentPersistenceHandle,
+        overrides: Option<&Value>,
+    ) -> Result<crate::protocol::AgentSnapshot> {
+        let id = new_id();
+        let payload = self
+            .request(agents::resume_agent_request(&id, handle, overrides))
+            .await?;
+        Self::resumed_agent(&payload)
+    }
+
+    pub async fn import_agent(
+        &self,
+        request: &agents::ImportAgentRequest,
+    ) -> Result<crate::protocol::AgentSnapshot> {
+        let id = new_id();
+        let payload = self
+            .request(agents::import_agent_request(&id, request))
+            .await?;
+        Self::resumed_agent(&payload)
+    }
+
+    pub async fn refresh_agent(&self, agent_id: &str) -> Result<()> {
+        let id = new_id();
+        let payload = self
+            .request(agents::refresh_agent_request(&id, agent_id))
+            .await?;
+        Self::ensure_ok(&payload)
+    }
+
+    pub async fn update_agent(
+        &self,
+        agent_id: &str,
+        name: Option<&str>,
+        labels: Option<&HashMap<String, String>>,
+    ) -> Result<()> {
+        let id = new_id();
+        let payload = self
+            .request(agents::update_agent_request(&id, agent_id, name, labels))
+            .await?;
+        Self::ensure_ok(&payload)
+    }
+
+    pub async fn detach_agent(&self, agent_id: &str) -> Result<()> {
+        let id = new_id();
+        let payload = self
+            .request(agents::detach_agent_request(&id, agent_id))
+            .await?;
+        Self::ensure_ok(&payload)
+    }
+
+    pub async fn rewind_agent(
+        &self,
+        agent_id: &str,
+        message_id: &str,
+        mode: agents::RewindMode,
+    ) -> Result<()> {
+        let id = new_id();
+        let payload = self
+            .request(agents::rewind_agent_request(&id, agent_id, message_id, mode))
+            .await?;
+        Self::ensure_ok(&payload)
+    }
+
+    pub async fn wait_for_finish(
+        &self,
+        agent_id: &str,
+        timeout_ms: Option<u32>,
+    ) -> Result<agents::WaitOutcome> {
+        let id = new_id();
+        let payload = self
+            .request(agents::wait_for_finish_request(&id, agent_id, timeout_ms))
+            .await?;
+        serde_json::from_value(payload).map_err(PaseoError::from)
+    }
+
+    pub async fn list_prompts(&self, agent_id: &str) -> Result<Vec<agents::PromptPreview>> {
+        let id = new_id();
+        let payload = self
+            .request(agents::list_prompts_request(&id, agent_id))
+            .await?;
+        Self::ensure_ok(&payload)?;
+        let prompts = payload
+            .get("prompts")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?
+            .unwrap_or_default();
+        Ok(prompts)
+    }
+
+    pub async fn fork_context(
+        &self,
+        agent_id: &str,
+        boundary_message_id: Option<&str>,
+    ) -> Result<agents::ForkedContext> {
+        let id = new_id();
+        let payload = self
+            .request(agents::fork_context_request(&id, agent_id, boundary_message_id))
+            .await?;
+        Self::ensure_ok(&payload)?;
+        serde_json::from_value(payload).map_err(PaseoError::from)
+    }
+
     pub async fn list_available_providers(&self) -> Result<Vec<String>> {
         let id = new_id();
         let payload = self
@@ -643,11 +774,19 @@ impl PaseoClient {
         .await
     }
 
-    pub async fn project_github_clone(&self, repo: &str, protocol: &str) -> Result<String> {
+    pub async fn project_github_clone(
+        &self,
+        repo: &str,
+        protocol: &str,
+        target_directory: &str,
+    ) -> Result<String> {
         let id = new_id();
         let payload = self
             .request(crate::protocol::workspaces::project_github_clone_request(
-                &id, repo, protocol,
+                &id,
+                repo,
+                protocol,
+                target_directory,
             ))
             .await?;
         if let Some(error) = payload.get("error").and_then(Value::as_str) {
@@ -655,10 +794,12 @@ impl PaseoClient {
         }
         payload
             .get("project")
-            .and_then(|p| p.get("rootPath"))
+            .and_then(|p| p.get("projectRootPath"))
             .and_then(Value::as_str)
             .map(str::to_string)
-            .ok_or_else(|| PaseoError::Protocol("github clone missing project.rootPath".into()))
+            .ok_or_else(|| {
+                PaseoError::Protocol("github clone missing project.projectRootPath".into())
+            })
     }
 
     pub async fn open_project(&self, cwd: &str) -> Result<String> {
