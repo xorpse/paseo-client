@@ -44,6 +44,11 @@ pub struct CreatedWorkspace {
     pub cwd: String,
 }
 
+enum FileWrite {
+    Written,
+    Conflict { modified_at: Option<String> },
+}
+
 pub struct TerminalHandle {
     terminal_id: String,
     slot: u8,
@@ -673,6 +678,96 @@ impl PaseoClient {
             .and_then(Value::as_str)
             .map(str::to_string)
             .ok_or_else(|| PaseoError::Protocol("create_directory missing directoryPath".into()))
+    }
+
+    pub async fn write_text_file(
+        &self,
+        cwd: &str,
+        parent_path: &str,
+        name: &str,
+        content: &str,
+    ) -> Result<String> {
+        if parent_path != "." && !parent_path.is_empty() {
+            let _ = self.fs_entry_create(cwd, ".", parent_path, "directory").await;
+        }
+        let path = self.fs_entry_create(cwd, parent_path, name, "file").await?;
+        let expected = match self.fs_file_write(cwd, &path, content, "").await? {
+            FileWrite::Written => return Ok(path),
+            FileWrite::Conflict { modified_at } => modified_at.ok_or_else(|| {
+                PaseoError::Protocol("file write conflict missing modifiedAt".into())
+            })?,
+        };
+        match self.fs_file_write(cwd, &path, content, &expected).await? {
+            FileWrite::Written => Ok(path),
+            FileWrite::Conflict { .. } => Err(PaseoError::Rpc("file write conflict".into())),
+        }
+    }
+
+    async fn fs_entry_create(
+        &self,
+        cwd: &str,
+        parent_path: &str,
+        name: &str,
+        kind: &str,
+    ) -> Result<String> {
+        let id = new_id();
+        let payload = self
+            .request(serde_json::json!({
+                "type": "fs.entry.create.request",
+                "cwd": cwd,
+                "parentPath": parent_path,
+                "name": name,
+                "kind": kind,
+                "requestId": id,
+            }))
+            .await?;
+        if let Some(error) = payload.get("error").and_then(Value::as_str) {
+            return Err(PaseoError::Rpc(error.to_owned()));
+        }
+        payload
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| PaseoError::Protocol("entry.create missing path".into()))
+    }
+
+    async fn fs_file_write(
+        &self,
+        cwd: &str,
+        path: &str,
+        content: &str,
+        expected_modified_at: &str,
+    ) -> Result<FileWrite> {
+        let id = new_id();
+        let payload = self
+            .request(serde_json::json!({
+                "type": "fs.file.write.request",
+                "cwd": cwd,
+                "path": path,
+                "content": content,
+                "expectedModifiedAt": expected_modified_at,
+                "requestId": id,
+            }))
+            .await?;
+        let result = payload.get("result").cloned().unwrap_or(Value::Null);
+        match result.get("status").and_then(Value::as_str) {
+            Some("written") => Ok(FileWrite::Written),
+            Some("conflict") => Ok(FileWrite::Conflict {
+                modified_at: result
+                    .get("version")
+                    .and_then(|version| version.get("modifiedAt"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            }),
+            Some("error") => Err(PaseoError::Rpc(
+                result
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("file write error")
+                    .to_owned(),
+            )),
+            _ => Err(PaseoError::Protocol("file write missing status".into())),
+        }
     }
 
     pub async fn directory_suggestions(&self, query: &str, limit: u32) -> Result<Vec<String>> {
