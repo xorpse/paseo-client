@@ -15,6 +15,7 @@ pub enum ConnectionState {
 
 #[derive(Clone, Debug)]
 pub enum TerminalStreamEvent {
+    Disconnected,
     Output(Vec<u8>),
     Restore(Vec<u8>),
     Snapshot(Value),

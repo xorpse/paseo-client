@@ -495,6 +495,10 @@ async fn spawn_editor_probe(client: &PaseoClient, cwd: &str) -> anyhow::Result<(
                         println!("[{label} +{} bytes] {:?}", bytes.len(), preview);
                     }
                     TerminalStreamEvent::Snapshot(_) => println!("[{label} snapshot]"),
+                    TerminalStreamEvent::Disconnected => {
+                        println!("[{label}] DISCONNECTED");
+                        break;
+                    }
                 }
             }
             println!("[{label}] STREAM ENDED after {total} bytes");
@@ -570,6 +574,10 @@ async fn stream_terminal(
                     print!("{}", String::from_utf8_lossy(&bytes));
                 }
                 TerminalStreamEvent::Snapshot(_) => println!("[snapshot]"),
+                TerminalStreamEvent::Disconnected => {
+                    println!("[disconnected]");
+                    break;
+                }
             }
         }
     };

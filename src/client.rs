@@ -141,7 +141,13 @@ impl PaseoClient {
                 Err(err) => break Err(err),
             }
         };
-        self.inner.terminals.lock().clear();
+        {
+            let mut senders = self.inner.terminals.lock();
+            for tx in senders.values() {
+                let _ = tx.send(TerminalStreamEvent::Disconnected);
+            }
+            senders.clear();
+        }
         self.inner.terminal_slots.lock().clear();
         self.emit(DaemonEvent::Disconnected);
         result
@@ -466,7 +472,9 @@ impl PaseoClient {
     ) -> Result<()> {
         let id = new_id();
         let payload = self
-            .request(agents::rewind_agent_request(&id, agent_id, message_id, mode))
+            .request(agents::rewind_agent_request(
+                &id, agent_id, message_id, mode,
+            ))
             .await?;
         Self::ensure_ok(&payload)
     }
@@ -505,7 +513,11 @@ impl PaseoClient {
     ) -> Result<agents::ForkedContext> {
         let id = new_id();
         let payload = self
-            .request(agents::fork_context_request(&id, agent_id, boundary_message_id))
+            .request(agents::fork_context_request(
+                &id,
+                agent_id,
+                boundary_message_id,
+            ))
             .await?;
         Self::ensure_ok(&payload)?;
         serde_json::from_value(payload).map_err(PaseoError::from)
@@ -688,7 +700,9 @@ impl PaseoClient {
         content: &str,
     ) -> Result<String> {
         if parent_path != "." && !parent_path.is_empty() {
-            let _ = self.fs_entry_create(cwd, ".", parent_path, "directory").await;
+            let _ = self
+                .fs_entry_create(cwd, ".", parent_path, "directory")
+                .await;
         }
         let path = self.fs_entry_create(cwd, parent_path, name, "file").await?;
         let expected = match self.fs_file_write(cwd, &path, content, "").await? {
