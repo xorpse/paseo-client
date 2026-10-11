@@ -1,14 +1,19 @@
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::channel::oneshot;
+use futures::future::{self, Either};
+use futures_timer::Delay;
 use parking_lot::Mutex;
 use serde_json::Value;
 
 use crate::binary_frames::{self, encode_input, encode_resize, Opcode};
 use crate::envelope::{
-    hello_message, parse_top_level, session_envelope, session_message_type, session_request_id,
-    Incoming,
+    hello_message, parse_top_level, ping_request, session_envelope, session_message_type,
+    session_request_id, Incoming,
 };
 use crate::error::{PaseoError, Result};
 use crate::events::{DaemonEvent, TerminalStreamEvent};
@@ -19,8 +24,23 @@ use crate::protocol::terminals::{self, CreateTerminalOpts, TerminalInfo};
 use crate::protocol::{agents, diff, subagents, ServerInfo};
 use crate::transport::{Frame, Transport, WsTransport};
 
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const GITHUB_CLONE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const PROVIDER_MODELS_TIMEOUT: Duration = Duration::from_secs(90);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
+const HEARTBEAT_FAILURE_THRESHOLD: u32 = 2;
+
 fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+async fn timed<F: Future>(future: F, timeout: Duration) -> Result<F::Output> {
+    match future::select(pin!(future), Delay::new(timeout)).await {
+        Either::Left((output, _)) => Ok(output),
+        Either::Right(_) => Err(PaseoError::Timeout),
+    }
 }
 
 struct Inner {
@@ -61,8 +81,11 @@ impl PaseoClient {
     pub async fn connect_relay(offer: &ConnectionOffer, client_id: &str) -> Result<PaseoClient> {
         let daemon_public_key = decode_daemon_public_key(offer)?;
         let url = build_relay_ws_url(&offer.relay.endpoint, offer.use_tls(), &offer.server_id)?;
-        let transport = WsTransport::connect_relay(&url, daemon_public_key).await?;
-        Self::finish_connect(transport, client_id).await
+        let connect = async {
+            let transport = WsTransport::connect_relay(&url, daemon_public_key).await?;
+            Self::finish_connect(transport, client_id).await
+        };
+        timed(connect, CONNECT_TIMEOUT).await?
     }
 
     pub async fn connect_local(
@@ -71,8 +94,11 @@ impl PaseoClient {
         password: Option<&str>,
         client_id: &str,
     ) -> Result<PaseoClient> {
-        let transport = WsTransport::connect_local(host_port, use_tls, password).await?;
-        Self::finish_connect(transport, client_id).await
+        let connect = async {
+            let transport = WsTransport::connect_local(host_port, use_tls, password).await?;
+            Self::finish_connect(transport, client_id).await
+        };
+        timed(connect, CONNECT_TIMEOUT).await?
     }
 
     async fn finish_connect(transport: Arc<WsTransport>, client_id: &str) -> Result<PaseoClient> {
@@ -127,19 +153,8 @@ impl PaseoClient {
     }
 
     pub async fn run(&self) -> Result<()> {
-        const OFFLOAD_JSON_BYTES: usize = 64 * 1024;
-        let result = loop {
-            match self.inner.transport.recv().await {
-                Ok(Some(frame)) => match &frame {
-                    Frame::Json(text) if text.len() > OFFLOAD_JSON_BYTES => {
-                        let client = self.clone();
-                        std::thread::spawn(move || client.dispatch(frame));
-                    }
-                    _ => self.dispatch(frame),
-                },
-                Ok(None) => break Ok(()),
-                Err(err) => break Err(err),
-            }
+        let result = match future::select(pin!(self.receive()), pin!(self.heartbeat())).await {
+            Either::Left((result, _)) | Either::Right((result, _)) => result,
         };
         {
             let mut senders = self.inner.terminals.lock();
@@ -148,12 +163,53 @@ impl PaseoClient {
             }
             senders.clear();
         }
+        self.inner.pending.lock().clear();
         self.inner.terminal_slots.lock().clear();
         self.emit(DaemonEvent::Disconnected);
         result
     }
 
+    async fn receive(&self) -> Result<()> {
+        const OFFLOAD_JSON_BYTES: usize = 64 * 1024;
+        loop {
+            match self.inner.transport.recv().await? {
+                Some(frame) => match &frame {
+                    Frame::Json(text) if text.len() > OFFLOAD_JSON_BYTES => {
+                        let client = self.clone();
+                        std::thread::spawn(move || client.dispatch(frame));
+                    }
+                    _ => self.dispatch(frame),
+                },
+                None => return Ok(()),
+            }
+        }
+    }
+
+    async fn heartbeat(&self) -> Result<()> {
+        let mut failures = 0;
+        loop {
+            Delay::new(HEARTBEAT_INTERVAL).await;
+            match self
+                .request_within(ping_request(&new_id()), Some(HEARTBEAT_TIMEOUT))
+                .await
+            {
+                Ok(_) | Err(PaseoError::Rpc(_)) => failures = 0,
+                Err(PaseoError::Timeout) => {
+                    failures += 1;
+                    if failures >= HEARTBEAT_FAILURE_THRESHOLD {
+                        return Err(PaseoError::Timeout);
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
     async fn request(&self, message: Value) -> Result<Value> {
+        self.request_within(message, Some(REQUEST_TIMEOUT)).await
+    }
+
+    async fn request_within(&self, message: Value, timeout: Option<Duration>) -> Result<Value> {
         let request_id = message
             .get("requestId")
             .and_then(Value::as_str)
@@ -164,15 +220,18 @@ impl PaseoClient {
         self.inner.pending.lock().insert(request_id.clone(), tx);
 
         let envelope = session_envelope(message).to_string();
-        if let Err(err) = self.inner.transport.send_text(envelope).await {
+        let exchange = async {
+            self.inner.transport.send_text(envelope).await?;
+            rx.await.map_err(|_| PaseoError::Closed)?
+        };
+        let result = match timeout {
+            Some(timeout) => timed(exchange, timeout).await.and_then(|result| result),
+            None => exchange.await,
+        };
+        if result.is_err() {
             self.inner.pending.lock().remove(&request_id);
-            return Err(err);
         }
-
-        match rx.await {
-            Ok(result) => result,
-            Err(_) => Err(PaseoError::Closed),
-        }
+        result
     }
 
     pub async fn fetch_agents(&self) -> Result<Vec<AgentListEntry>> {
@@ -486,7 +545,10 @@ impl PaseoClient {
     ) -> Result<agents::WaitOutcome> {
         let id = new_id();
         let payload = self
-            .request(agents::wait_for_finish_request(&id, agent_id, timeout_ms))
+            .request_within(
+                agents::wait_for_finish_request(&id, agent_id, timeout_ms),
+                timeout_ms.map(|ms| Duration::from_millis(u64::from(ms)) + REQUEST_TIMEOUT),
+            )
             .await?;
         serde_json::from_value(payload).map_err(PaseoError::from)
     }
@@ -636,7 +698,10 @@ impl PaseoClient {
     ) -> Result<Vec<crate::protocol::agents::ModelDefinition>> {
         let id = new_id();
         let payload = self
-            .request(agents::list_provider_models_request(&id, provider, cwd))
+            .request_within(
+                agents::list_provider_models_request(&id, provider, cwd),
+                Some(PROVIDER_MODELS_TIMEOUT),
+            )
             .await?;
         let models = payload.get("models").cloned().unwrap_or(Value::Null);
         Ok(serde_json::from_value(models).unwrap_or_default())
@@ -895,12 +960,15 @@ impl PaseoClient {
     ) -> Result<String> {
         let id = new_id();
         let payload = self
-            .request(crate::protocol::workspaces::project_github_clone_request(
-                &id,
-                repo,
-                protocol,
-                target_directory,
-            ))
+            .request_within(
+                crate::protocol::workspaces::project_github_clone_request(
+                    &id,
+                    repo,
+                    protocol,
+                    target_directory,
+                ),
+                Some(GITHUB_CLONE_TIMEOUT),
+            )
             .await?;
         if let Some(error) = payload.get("error").and_then(Value::as_str) {
             return Err(PaseoError::Rpc(error.to_owned()));

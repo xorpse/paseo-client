@@ -29,6 +29,10 @@ pub fn ping_message() -> Value {
     json!({ "type": "ping" })
 }
 
+pub fn ping_request(request_id: &str) -> Value {
+    json!({ "type": "ping", "requestId": request_id })
+}
+
 pub fn session_envelope(message: Value) -> Value {
     json!({ "type": "session", "message": message })
 }
