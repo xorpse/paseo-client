@@ -1,0 +1,19 @@
+[
+  {
+    "type": "list_provider_models_response",
+    "payload": {
+      "provider": "claude",
+      "models": [
+        {
+          "provider": "claude",
+          "id": "opus",
+          "label": "Opus",
+          "contextWindowMaxTokens": 1000000.5
+        }
+      ],
+      "error": null,
+      "fetchedAt": "2026-10-16T00:00:00.000Z",
+      "requestId": "req-models"
+    }
+  }
+]

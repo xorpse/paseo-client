@@ -1,0 +1,70 @@
+[
+  {
+    "type": "agent_update",
+    "payload": {
+      "subscriptionId": "sub-agents",
+      "kind": "upsert",
+      "agent": {
+        "id": "agent-1",
+        "provider": "claude",
+        "cwd": "/work/repo",
+        "model": null,
+        "createdAt": "2026-10-16T00:00:00.000Z",
+        "updatedAt": "2026-10-16T00:00:00.000Z",
+        "lastUserMessageAt": null,
+        "status": "running",
+        "capabilities": {
+          "supportsStreaming": true,
+          "supportsSessionPersistence": true,
+          "supportsDynamicModes": false,
+          "supportsMcpServers": false,
+          "supportsReasoningStream": true,
+          "supportsToolInvocations": true
+        },
+        "currentModeId": null,
+        "availableModes": [],
+        "pendingPermissions": [
+          {
+            "id": "perm-1",
+            "provider": "claude",
+            "name": "Read",
+            "kind": "tool",
+            "input": {
+              "file_path": "src/main.rs",
+              "offset": -1.5
+            },
+            "detail": {
+              "type": "read",
+              "filePath": "src/main.rs",
+              "offset": -1.5,
+              "limit": 0.5
+            }
+          }
+        ],
+        "persistence": null,
+        "title": null,
+        "lastUsage": {
+          "inputTokens": 10.5,
+          "cachedInputTokens": 0.25,
+          "outputTokens": -3,
+          "totalCostUsd": 0.015,
+          "contextWindowMaxTokens": 200000.5,
+          "contextWindowUsedTokens": 1234.75
+        }
+      },
+      "project": {
+        "projectKey": "/work/repo",
+        "projectName": "repo",
+        "checkout": {
+          "cwd": "/work/repo",
+          "isGit": false,
+          "currentBranch": null,
+          "remoteUrl": null,
+          "worktreeRoot": null,
+          "isPaseoOwnedWorktree": false,
+          "mainRepoRoot": null
+        }
+      }
+    }
+  }
+]

@@ -1,35 +1,83 @@
-use serde::Deserialize;
-use serde_json::{json, Value};
+use serde::{Deserialize, Serialize};
 
-use crate::protocol::timeline::TimelineItem;
+use crate::protocol::timeline::{TimelineCursor, TimelineDirection, TimelineItem, TimelineWindow};
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentStatus {
+    Canceled,
+    Completed,
+    Failed,
+    Running,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderSubagent {
-    pub id: String,
+    id: String,
+    parent_agent_id: String,
     #[serde(default)]
-    pub parent_agent_id: String,
+    parent_subagent_id: Option<String>,
+    provider: String,
+    title: Option<String>,
+    description: Option<String>,
+    status: SubagentStatus,
+    created_at: String,
+    updated_at: String,
+    tool_call_id: Option<String>,
     #[serde(default)]
-    pub provider: String,
+    cwd: Option<String>,
     #[serde(default)]
-    pub title: Option<String>,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub status: String,
-    #[serde(default)]
-    pub created_at: String,
-    #[serde(default)]
-    pub updated_at: String,
-    #[serde(default)]
-    pub tool_call_id: Option<String>,
-    #[serde(default)]
-    pub cwd: Option<String>,
+    subtitle: Option<String>,
 }
 
 impl ProviderSubagent {
-    pub fn is_running(&self) -> bool {
-        self.status == "running"
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn parent_agent_id(&self) -> &str {
+        &self.parent_agent_id
+    }
+
+    pub fn parent_subagent_id(&self) -> Option<&str> {
+        self.parent_subagent_id.as_deref()
+    }
+
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
+    pub fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    pub fn status(&self) -> SubagentStatus {
+        self.status
+    }
+
+    pub fn created_at(&self) -> &str {
+        &self.created_at
+    }
+
+    pub fn updated_at(&self) -> &str {
+        &self.updated_at
+    }
+
+    pub fn tool_call_id(&self) -> Option<&str> {
+        self.tool_call_id.as_deref()
+    }
+
+    pub fn cwd(&self) -> Option<&str> {
+        self.cwd.as_deref()
+    }
+
+    pub fn subtitle(&self) -> Option<&str> {
+        self.subtitle.as_deref()
     }
 
     pub fn label(&self) -> &str {
@@ -41,103 +89,236 @@ impl ProviderSubagent {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SubagentUpdate {
-    Remove {
-        parent_agent_id: String,
-        subagent_id: String,
-    },
-    Timeline {
-        parent_agent_id: String,
-        subagent_id: String,
-        item: Box<TimelineItem>,
-    },
-    Upsert(Box<ProviderSubagent>),
+    Remove(SubagentRemoval),
+    Timeline(SubagentTimelineUpdate),
+    Upsert(SubagentUpsert),
 }
 
-pub fn list_request(request_id: &str, parent_agent_id: &str) -> Value {
-    json!({
-        "type": "agent.provider_subagents.list.request",
-        "parentAgentId": parent_agent_id,
-        "requestId": request_id
-    })
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentRemoval {
+    parent_agent_id: String,
+    subagent_id: String,
 }
 
-pub fn timeline_request(
-    request_id: &str,
-    parent_agent_id: &str,
-    subagent_id: &str,
-    direction: &str,
-    limit: u32,
-) -> Value {
-    json!({
-        "type": "agent.provider_subagents.timeline.get.request",
-        "parentAgentId": parent_agent_id,
-        "subagentId": subagent_id,
-        "requestId": request_id,
-        "direction": direction,
-        "limit": limit
-    })
+impl SubagentRemoval {
+    pub fn parent_agent_id(&self) -> &str {
+        &self.parent_agent_id
+    }
+
+    pub fn subagent_id(&self) -> &str {
+        &self.subagent_id
+    }
 }
 
-pub fn parse_list(payload: &Value) -> Vec<ProviderSubagent> {
-    payload
-        .get("subagents")
-        .and_then(Value::as_array)
-        .map(|entries| {
-            entries
-                .iter()
-                .filter_map(|entry| serde_json::from_value(entry.clone()).ok())
-                .collect()
-        })
-        .unwrap_or_default()
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentTimelineUpdate {
+    parent_agent_id: String,
+    subagent_id: String,
+    provider: String,
+    item: Box<TimelineItem>,
+    timestamp: String,
+    seq: u64,
+    epoch: String,
 }
 
-pub fn parse_timeline(payload: &Value) -> Vec<TimelineItem> {
-    payload
-        .get("rows")
-        .and_then(Value::as_array)
-        .map(|rows| {
-            rows.iter()
-                .filter_map(|row| row.get("item").cloned())
-                .filter_map(|item| serde_json::from_value(item).ok())
-                .collect()
-        })
-        .unwrap_or_default()
+impl SubagentTimelineUpdate {
+    pub fn parent_agent_id(&self) -> &str {
+        &self.parent_agent_id
+    }
+
+    pub fn subagent_id(&self) -> &str {
+        &self.subagent_id
+    }
+
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    pub fn item(&self) -> &TimelineItem {
+        &self.item
+    }
+
+    pub fn timestamp(&self) -> &str {
+        &self.timestamp
+    }
+
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    pub fn epoch(&self) -> &str {
+        &self.epoch
+    }
 }
 
-pub fn parse_update(payload: &Value) -> Option<SubagentUpdate> {
-    let parent_agent_id = || {
-        payload
-            .get("parentAgentId")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string()
-    };
-    let subagent_id = || {
-        payload
-            .get("subagentId")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string()
-    };
-    match payload.get("kind").and_then(Value::as_str)? {
-        "remove" => Some(SubagentUpdate::Remove {
-            parent_agent_id: parent_agent_id(),
-            subagent_id: subagent_id(),
-        }),
-        "timeline" => {
-            let item = serde_json::from_value(payload.get("item")?.clone()).ok()?;
-            Some(SubagentUpdate::Timeline {
-                parent_agent_id: parent_agent_id(),
-                subagent_id: subagent_id(),
-                item: Box::new(item),
-            })
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct SubagentUpsert {
+    subagent: Box<ProviderSubagent>,
+}
+
+impl SubagentUpsert {
+    pub fn subagent(&self) -> &ProviderSubagent {
+        &self.subagent
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentTimelineRow {
+    item: TimelineItem,
+    timestamp: String,
+    seq: u64,
+    #[serde(default)]
+    seq_start: Option<u64>,
+    #[serde(default)]
+    seq_end: Option<u64>,
+}
+
+impl SubagentTimelineRow {
+    pub fn item(&self) -> &TimelineItem {
+        &self.item
+    }
+
+    pub fn timestamp(&self) -> &str {
+        &self.timestamp
+    }
+
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    pub fn seq_start(&self) -> Option<u64> {
+        self.seq_start
+    }
+
+    pub fn seq_end(&self) -> Option<u64> {
+        self.seq_end
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentTimelinePage {
+    parent_agent_id: String,
+    subagent_id: String,
+    provider: Option<String>,
+    direction: TimelineDirection,
+    epoch: String,
+    #[serde(default)]
+    start_cursor: Option<TimelineCursor>,
+    #[serde(default)]
+    end_cursor: Option<TimelineCursor>,
+    reset: bool,
+    stale_cursor: bool,
+    gap: bool,
+    window: TimelineWindow,
+    has_older: bool,
+    has_newer: bool,
+    rows: Vec<SubagentTimelineRow>,
+}
+
+impl SubagentTimelinePage {
+    pub fn parent_agent_id(&self) -> &str {
+        &self.parent_agent_id
+    }
+
+    pub fn subagent_id(&self) -> &str {
+        &self.subagent_id
+    }
+
+    pub fn provider(&self) -> Option<&str> {
+        self.provider.as_deref()
+    }
+
+    pub fn direction(&self) -> TimelineDirection {
+        self.direction
+    }
+
+    pub fn epoch(&self) -> &str {
+        &self.epoch
+    }
+
+    pub fn start_cursor(&self) -> Option<&TimelineCursor> {
+        self.start_cursor.as_ref()
+    }
+
+    pub fn end_cursor(&self) -> Option<&TimelineCursor> {
+        self.end_cursor.as_ref()
+    }
+
+    pub fn reset(&self) -> bool {
+        self.reset
+    }
+
+    pub fn stale_cursor(&self) -> bool {
+        self.stale_cursor
+    }
+
+    pub fn gap(&self) -> bool {
+        self.gap
+    }
+
+    pub fn window(&self) -> TimelineWindow {
+        self.window
+    }
+
+    pub fn has_older(&self) -> bool {
+        self.has_older
+    }
+
+    pub fn has_newer(&self) -> bool {
+        self.has_newer
+    }
+
+    pub fn rows(&self) -> &[SubagentTimelineRow] {
+        &self.rows
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentTimelineQuery {
+    parent_agent_id: String,
+    subagent_id: String,
+    direction: TimelineDirection,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cursor: Option<TimelineCursor>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit: Option<u32>,
+}
+
+impl SubagentTimelineQuery {
+    pub fn tail(
+        parent_agent_id: impl Into<String>,
+        subagent_id: impl Into<String>,
+        limit: u32,
+    ) -> SubagentTimelineQuery {
+        SubagentTimelineQuery {
+            parent_agent_id: parent_agent_id.into(),
+            subagent_id: subagent_id.into(),
+            direction: TimelineDirection::Tail,
+            cursor: None,
+            limit: Some(limit),
         }
-        "upsert" => {
-            let subagent = serde_json::from_value(payload.get("subagent")?.clone()).ok()?;
-            Some(SubagentUpdate::Upsert(Box::new(subagent)))
+    }
+
+    pub fn before(
+        parent_agent_id: impl Into<String>,
+        subagent_id: impl Into<String>,
+        cursor: TimelineCursor,
+        limit: u32,
+    ) -> SubagentTimelineQuery {
+        SubagentTimelineQuery {
+            parent_agent_id: parent_agent_id.into(),
+            subagent_id: subagent_id.into(),
+            direction: TimelineDirection::Before,
+            cursor: Some(cursor),
+            limit: Some(limit),
         }
-        _ => None,
     }
 }

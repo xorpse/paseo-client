@@ -1,67 +1,148 @@
-use serde_json::{json, Value};
+use std::borrow::Cow;
 
-pub fn capabilities() -> Value {
-    json!({
-        "custom_mode_icons": true,
-        "reasoning_merge_enum": true,
-        "terminal_reflowable_snapshot": true,
-        "provider_subagents": true,
-        "project_updates": true,
-        "selective_agent_timeline": true
+use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
+
+use crate::error::HelloRejection;
+
+#[derive(Serialize)]
+struct Session<'a, B> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    message: Tagged<'a, B>,
+}
+
+#[derive(Serialize)]
+struct Tagged<'a, B> {
+    #[serde(rename = "type")]
+    kind: &'a str,
+    #[serde(rename = "requestId", skip_serializing_if = "Option::is_none")]
+    request_id: Option<&'a str>,
+    #[serde(flatten)]
+    body: &'a B,
+}
+
+pub(crate) fn session_message<B: Serialize>(
+    kind: &str,
+    request_id: Option<&str>,
+    body: &B,
+) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&Session {
+        kind: "session",
+        message: Tagged {
+            kind,
+            request_id,
+            body,
+        },
     })
 }
 
-pub fn hello_message(client_id: &str, app_version: Option<&str>) -> Value {
-    let mut msg = json!({
-        "type": "hello",
-        "clientId": client_id,
-        "clientType": "cli",
-        "protocolVersion": 1,
-        "capabilities": capabilities()
-    });
-    if let Some(version) = app_version {
-        msg["appVersion"] = json!(version);
+#[derive(Serialize)]
+pub(crate) struct NoFields {}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub(crate) enum HelloAuth<'a> {
+    Password { password: &'a str },
+}
+
+#[derive(Serialize)]
+pub(crate) struct Capabilities {
+    all_providers: bool,
+    custom_mode_icons: bool,
+    explicit_event_subscriptions: bool,
+    hello_rejection: bool,
+    owned_subscriptions: bool,
+    project_updates: bool,
+    projected_subagent_timeline: bool,
+    provider_subagents: bool,
+    reasoning_merge_enum: bool,
+    selective_agent_timeline: bool,
+    terminal_reflowable_snapshot: bool,
+    timeline_notifications: bool,
+    timeline_replacement_invalidation: bool,
+    workspace_setup_blocked: bool,
+}
+
+impl Capabilities {
+    const SUPPORTED: Capabilities = Capabilities {
+        all_providers: true,
+        custom_mode_icons: true,
+        explicit_event_subscriptions: true,
+        hello_rejection: true,
+        owned_subscriptions: true,
+        project_updates: true,
+        projected_subagent_timeline: true,
+        provider_subagents: true,
+        reasoning_merge_enum: true,
+        selective_agent_timeline: true,
+        terminal_reflowable_snapshot: true,
+        timeline_notifications: true,
+        timeline_replacement_invalidation: true,
+        workspace_setup_blocked: true,
+    };
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Hello<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    client_id: &'a str,
+    client_type: &'static str,
+    protocol_version: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth: Option<HelloAuth<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    app_version: Option<&'a str>,
+    capabilities: &'static Capabilities,
+}
+
+impl<'a> Hello<'a> {
+    pub(crate) fn new(
+        client_id: &'a str,
+        password: Option<&'a str>,
+        app_version: Option<&'a str>,
+    ) -> Hello<'a> {
+        Hello {
+            kind: "hello",
+            client_id,
+            client_type: "cli",
+            protocol_version: 1,
+            auth: password.map(|password| HelloAuth::Password { password }),
+            app_version,
+            capabilities: &Capabilities::SUPPORTED,
+        }
     }
-    msg
 }
 
-pub fn ping_message() -> Value {
-    json!({ "type": "ping" })
+pub(crate) const PING: &str = r#"{"type":"ping"}"#;
+
+#[derive(Deserialize)]
+pub(crate) struct Envelope<'a> {
+    #[serde(rename = "type", borrow)]
+    pub(crate) kind: Cow<'a, str>,
+    #[serde(borrow, default)]
+    pub(crate) message: Option<&'a RawValue>,
+    #[serde(default)]
+    pub(crate) reason: Option<HelloRejection>,
 }
 
-pub fn ping_request(request_id: &str) -> Value {
-    json!({ "type": "ping", "requestId": request_id })
+#[derive(Deserialize)]
+pub(crate) struct MessageHead<'a> {
+    #[serde(rename = "type", borrow)]
+    pub(crate) kind: Cow<'a, str>,
+    #[serde(borrow, default)]
+    pub(crate) payload: Option<&'a RawValue>,
 }
 
-pub fn session_envelope(message: Value) -> Value {
-    json!({ "type": "session", "message": message })
-}
-
-pub enum Incoming {
-    Pong,
-    Session(Value),
-    Unknown(Value),
-}
-
-pub fn parse_top_level(text: &str) -> Result<Incoming, serde_json::Error> {
-    let value: Value = serde_json::from_str(text)?;
-    let ty = value.get("type").and_then(Value::as_str).unwrap_or("");
-    Ok(match ty {
-        "pong" => Incoming::Pong,
-        "session" => Incoming::Session(value.get("message").cloned().unwrap_or(Value::Null)),
-        _ => Incoming::Unknown(value),
-    })
-}
-
-pub fn session_message_type(message: &Value) -> &str {
-    message.get("type").and_then(Value::as_str).unwrap_or("")
-}
-
-pub fn session_request_id(message: &Value) -> Option<String> {
-    message
-        .get("payload")
-        .and_then(|p| p.get("requestId"))
-        .or_else(|| message.get("requestId"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PayloadHead<'a> {
+    #[serde(borrow, default)]
+    pub(crate) request_id: Option<Cow<'a, str>>,
+    #[serde(borrow, default)]
+    pub(crate) subscription_id: Option<Cow<'a, str>>,
+    #[serde(borrow, default)]
+    pub(crate) status: Option<Cow<'a, str>>,
 }

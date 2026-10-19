@@ -1,1269 +1,903 @@
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::{HashMap, hash_map::Entry};
 use std::future::Future;
 use std::pin::pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use async_io::Timer;
+use async_tungstenite::tungstenite::Message;
+use futures::StreamExt;
 use futures::channel::oneshot;
 use futures::future::{self, Either};
-use futures_timer::Delay;
+use futures_rustls::rustls::ClientConfig;
 use parking_lot::Mutex;
+use serde::de::Error as _;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use serde_json::value::RawValue;
 
-use crate::binary_frames::{self, encode_input, encode_resize, Opcode};
-use crate::envelope::{
-    hello_message, parse_top_level, ping_request, session_envelope, session_message_type,
-    session_request_id, Incoming,
-};
-use crate::error::{PaseoError, Result};
-use crate::events::{DaemonEvent, TerminalStreamEvent};
-use crate::offer::{build_relay_ws_url, decode_daemon_public_key, ConnectionOffer};
-use crate::protocol::agents::{AgentListEntry, PermissionResponse};
-use crate::protocol::stream::{AgentStreamEvent, AgentUpdate};
-use crate::protocol::terminals::{self, CreateTerminalOpts, TerminalInfo};
-use crate::protocol::{agents, diff, subagents, ServerInfo};
-use crate::transport::{Frame, Transport, WsTransport};
+use crate::binary_frames::{ChannelFrame, Opcode, ResizeIntent, ResizePayload, TerminalFrame};
+use crate::channel::ChannelEndpoint;
+use crate::endpoint::ConnectTarget;
+use crate::envelope::{Envelope, Hello, MessageHead, PING, PayloadHead, session_message};
+use crate::error::{PaseoError, ProtocolViolation, RpcError};
+use crate::protocol::agents::CreationSnapshot;
+use crate::protocol::daemon::{DaemonFeature, ServerInfo};
+use crate::protocol::terminals::{TerminalSize, TerminalStreamEvent};
+use crate::transport::{Connection, Frame, Socket, Wire};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-const GITHUB_CLONE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-const PROVIDER_MODELS_TIMEOUT: Duration = Duration::from_secs(90);
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
-const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
-const HEARTBEAT_FAILURE_THRESHOLD: u32 = 2;
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const LIVENESS_INTERVAL: Duration = Duration::from_secs(10);
+const LIVENESS_TIMEOUT: Duration = Duration::from_secs(15);
+const LIVENESS_FAILURE_THRESHOLD: u32 = 2;
 
-fn new_id() -> String {
+pub(crate) async fn timed<F: Future>(future: F, timeout: Duration) -> Option<F::Output> {
+    match future::select(pin!(future), Timer::after(timeout)).await {
+        Either::Left((output, _)) => Some(output),
+        Either::Right(_) => None,
+    }
+}
+
+pub(crate) fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-async fn timed<F: Future>(future: F, timeout: Duration) -> Result<F::Output> {
-    match future::select(pin!(future), Delay::new(timeout)).await {
-        Either::Left((output, _)) => Ok(output),
-        Either::Right(_) => Err(PaseoError::Timeout),
+#[derive(Clone)]
+pub struct ConnectOptions {
+    client_id: String,
+    tls: Arc<ClientConfig>,
+    app_version: Option<String>,
+    outdated_daemons: bool,
+}
+
+impl ConnectOptions {
+    pub fn new(client_id: impl Into<String>, tls: Arc<ClientConfig>) -> ConnectOptions {
+        ConnectOptions {
+            client_id: client_id.into(),
+            tls,
+            app_version: None,
+            outdated_daemons: false,
+        }
+    }
+
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
+    pub fn app_version(&self) -> Option<&str> {
+        self.app_version.as_deref()
+    }
+
+    pub fn set_app_version(&mut self, app_version: Option<String>) {
+        self.app_version = app_version;
+    }
+
+    pub fn with_app_version(mut self, app_version: impl Into<String>) -> ConnectOptions {
+        self.set_app_version(Some(app_version.into()));
+        self
+    }
+
+    pub fn outdated_daemons(&self) -> bool {
+        self.outdated_daemons
+    }
+
+    /// Connects to daemons that lack the subscription features the client is built on, so
+    /// they can be upgraded. Only plain requests are reliable on such a connection.
+    pub fn with_outdated_daemons(mut self) -> ConnectOptions {
+        self.outdated_daemons = true;
+        self
     }
 }
 
-struct Inner {
-    transport: Arc<dyn Transport>,
-    pending: Mutex<HashMap<String, oneshot::Sender<Result<Value>>>>,
-    events_tx: async_broadcast::Sender<DaemonEvent>,
-    _events_keep: async_broadcast::InactiveReceiver<DaemonEvent>,
-    terminals: Mutex<HashMap<u8, flume::Sender<TerminalStreamEvent>>>,
-    terminal_slots: Mutex<HashMap<String, u8>>,
-    server_info: ServerInfo,
+pub(crate) type Updates<U> = flume::Sender<Result<U, PaseoError>>;
+
+pub(crate) trait Routed: Sized + Send + 'static {
+    fn decode(kind: &str, message: &RawValue) -> Result<Self, PaseoError>;
 }
+
+pub(crate) type Deliver = Arc<dyn Fn(&str, &RawValue) + Send + Sync>;
+
+struct Route {
+    deliver: Deliver,
+    terminal_slot: Option<u8>,
+    channel: Option<u32>,
+}
+
+struct SlotOwner {
+    subscription_id: String,
+    events: Updates<TerminalStreamEvent>,
+}
+
+type Reply = Result<Box<RawValue>, PaseoError>;
+type Registration =
+    Box<dyn FnOnce(&mut State, &PayloadHead<'_>, &RawValue) -> Result<(), PaseoError> + Send>;
+
+struct Pending {
+    response_type: &'static str,
+    request_type: &'static str,
+    reply: oneshot::Sender<Reply>,
+    registration: Option<Registration>,
+}
+
+#[derive(Default)]
+pub(crate) struct State {
+    connected: bool,
+    pending: HashMap<String, Pending>,
+    routes: HashMap<String, Route>,
+    terminal_slots: HashMap<u8, SlotOwner>,
+    channels: HashMap<u32, Arc<dyn ChannelEndpoint>>,
+    creations: HashMap<String, Updates<CreationSnapshot>>,
+}
+
+struct Driver {
+    socket: Socket,
+    wire: Wire,
+    outgoing: flume::Receiver<Outgoing>,
+    pongs: flume::Receiver<()>,
+}
+
+pub(crate) enum Outgoing {
+    Close,
+    Frame(Frame),
+}
+
+pub(crate) struct Inner {
+    server_info: ServerInfo,
+    outgoing: flume::Sender<Outgoing>,
+    pongs: flume::Sender<()>,
+    liveness_failures: AtomicU32,
+    state: Mutex<State>,
+    driver: Mutex<Option<Driver>>,
+}
+
+const REQUIRED_FEATURES: [DaemonFeature; 2] = [
+    DaemonFeature::OwnedSubscriptions,
+    DaemonFeature::ExplicitEventSubscriptions,
+];
 
 #[derive(Clone)]
 pub struct PaseoClient {
-    inner: Arc<Inner>,
-}
-
-#[derive(Clone, Debug)]
-pub struct CreatedWorkspace {
-    pub id: String,
-    pub cwd: String,
-}
-
-enum FileWrite {
-    Written,
-    Conflict { modified_at: Option<String> },
-}
-
-pub struct TerminalHandle {
-    terminal_id: String,
-    slot: u8,
-    transport: Arc<dyn Transport>,
-    owner: PaseoClient,
-    output_rx: flume::Receiver<TerminalStreamEvent>,
+    pub(crate) inner: Arc<Inner>,
 }
 
 impl PaseoClient {
-    pub async fn connect_relay(offer: &ConnectionOffer, client_id: &str) -> Result<PaseoClient> {
-        let daemon_public_key = decode_daemon_public_key(offer)?;
-        let url = build_relay_ws_url(&offer.relay.endpoint, offer.use_tls(), &offer.server_id)?;
-        let connect = async {
-            let transport = WsTransport::connect_relay(&url, daemon_public_key).await?;
-            Self::finish_connect(transport, client_id).await
-        };
-        timed(connect, CONNECT_TIMEOUT).await?
+    /// Whether the daemon lacks features the client is built on, which only a connection made
+    /// with [`ConnectOptions::with_outdated_daemons`] allows.
+    pub fn is_outdated(&self) -> bool {
+        REQUIRED_FEATURES
+            .iter()
+            .any(|feature| !self.server_info().supports(*feature))
     }
 
-    pub async fn connect_local(
-        host_port: &str,
-        use_tls: bool,
-        password: Option<&str>,
-        client_id: &str,
-    ) -> Result<PaseoClient> {
+    pub async fn connect(
+        target: &ConnectTarget,
+        options: &ConnectOptions,
+    ) -> Result<PaseoClient, PaseoError> {
         let connect = async {
-            let transport = WsTransport::connect_local(host_port, use_tls, password).await?;
-            Self::finish_connect(transport, client_id).await
+            let Connection { mut socket, wire } =
+                Connection::open(target.endpoint(), &options.tls).await?;
+            let hello = Hello::new(
+                &options.client_id,
+                target.password(),
+                options.app_version.as_deref(),
+            );
+            socket
+                .send(wire.encode(Frame::Text(serde_json::to_string(&hello)?))?)
+                .await?;
+            let server_info = Self::await_server_info(&mut socket, &wire).await?;
+            Ok::<_, PaseoError>((socket, wire, server_info))
         };
-        timed(connect, CONNECT_TIMEOUT).await?
-    }
-
-    async fn finish_connect(transport: Arc<WsTransport>, client_id: &str) -> Result<PaseoClient> {
-        let transport: Arc<dyn Transport> = transport;
-        transport
-            .send_text(hello_message(client_id, None).to_string())
-            .await?;
-
-        let server_info = loop {
-            match transport.recv().await? {
-                None => return Err(PaseoError::Handshake("closed before server_info".into())),
-                Some(Frame::Json(text)) => {
-                    if let Some(info) = try_parse_server_info(&text) {
-                        break info;
-                    }
-                }
-                Some(Frame::Binary(_)) => continue,
+        let (socket, wire, server_info) =
+            timed(connect, CONNECT_TIMEOUT)
+                .await
+                .ok_or(PaseoError::Timeout {
+                    request_type: "connect",
+                })??;
+        for feature in REQUIRED_FEATURES {
+            if !server_info.supports(feature) && !options.outdated_daemons {
+                return Err(PaseoError::UnsupportedDaemon {
+                    feature: feature.wire_name(),
+                });
             }
-        };
+        }
+        let (outgoing, outgoing_rx) = flume::unbounded();
+        let (pongs, pongs_rx) = flume::bounded(1);
+        Ok(PaseoClient {
+            inner: Arc::new(Inner {
+                server_info,
+                outgoing,
+                pongs,
+                liveness_failures: AtomicU32::new(0),
+                state: Mutex::new(State {
+                    connected: true,
+                    ..State::default()
+                }),
+                driver: Mutex::new(Some(Driver {
+                    socket,
+                    wire,
+                    outgoing: outgoing_rx,
+                    pongs: pongs_rx,
+                })),
+            }),
+        })
+    }
 
-        let (mut events_tx, events_rx) = async_broadcast::broadcast(1024);
-        events_tx.set_overflow(true);
-
-        let inner = Arc::new(Inner {
-            transport,
-            pending: Mutex::new(HashMap::new()),
-            events_tx,
-            _events_keep: events_rx.deactivate(),
-            terminals: Mutex::new(HashMap::new()),
-            terminal_slots: Mutex::new(HashMap::new()),
-            server_info,
-        });
-
-        Ok(PaseoClient { inner })
+    async fn await_server_info(socket: &mut Socket, wire: &Wire) -> Result<ServerInfo, PaseoError> {
+        while let Some(message) = socket.next().await {
+            let message = message?;
+            if let Message::Close(_) = message {
+                break;
+            }
+            let Some(Frame::Text(text)) = wire.decode(message)? else {
+                continue;
+            };
+            let envelope = serde_json::from_str::<Envelope<'_>>(&text)?;
+            if envelope.kind == "hello.rejected" {
+                let reason = envelope.reason.ok_or_else(|| {
+                    PaseoError::decode("hello.rejected", serde_json::Error::missing_field("reason"))
+                })?;
+                return Err(PaseoError::HelloRejected(reason));
+            }
+            let Some(message) = envelope.message.filter(|_| envelope.kind == "session") else {
+                continue;
+            };
+            let head = serde_json::from_str::<MessageHead<'_>>(message.get())?;
+            let Some(payload) = head.payload.filter(|_| head.kind == "status") else {
+                continue;
+            };
+            let status = serde_json::from_str::<PayloadHead<'_>>(payload.get())?;
+            if status.status.as_deref() == Some("server_info") {
+                return serde_json::from_str::<ServerInfo>(payload.get())
+                    .map_err(|error| PaseoError::decode("server_info", error));
+            }
+        }
+        Err(ProtocolViolation::ClosedDuringHandshake.into())
     }
 
     pub fn server_info(&self) -> &ServerInfo {
         &self.inner.server_info
     }
 
-    pub fn feature_enabled(&self, name: &str) -> bool {
-        self.inner
-            .server_info
-            .features
-            .get(name)
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
+    pub fn is_connected(&self) -> bool {
+        self.inner.state.lock().connected
     }
 
-    pub fn events(&self) -> async_broadcast::Receiver<DaemonEvent> {
-        self.inner.events_tx.new_receiver()
+    pub fn close(&self) {
+        self.inner.disconnect();
+        self.inner.outgoing.send(Outgoing::Close).ok();
     }
 
-    pub async fn run(&self) -> Result<()> {
-        let result = match future::select(pin!(self.receive()), pin!(self.heartbeat())).await {
-            Either::Left((result, _)) | Either::Right((result, _)) => result,
+    pub async fn run(&self) -> Result<(), PaseoError> {
+        let driver = self.inner.driver.lock().take().ok_or(PaseoError::Closed)?;
+        let _disconnect = Disconnect { inner: &self.inner };
+        let Driver {
+            socket,
+            wire,
+            outgoing,
+            pongs,
+        } = driver;
+        let (mut sink, mut stream) = socket.split();
+        let reader = async {
+            while let Some(message) = stream.next().await {
+                let message = message?;
+                if let Message::Close(_) = message {
+                    return Ok(());
+                }
+                self.inner.liveness_failures.store(0, Ordering::Relaxed);
+                if let Some(frame) = wire.decode(message)? {
+                    self.inner.dispatch(frame);
+                }
+            }
+            Ok(())
         };
-        {
-            let mut senders = self.inner.terminals.lock();
-            for tx in senders.values() {
-                let _ = tx.send(TerminalStreamEvent::Disconnected);
-            }
-            senders.clear();
-        }
-        self.inner.pending.lock().clear();
-        self.inner.terminal_slots.lock().clear();
-        self.emit(DaemonEvent::Disconnected);
-        result
-    }
-
-    async fn receive(&self) -> Result<()> {
-        const OFFLOAD_JSON_BYTES: usize = 64 * 1024;
-        loop {
-            match self.inner.transport.recv().await? {
-                Some(frame) => match &frame {
-                    Frame::Json(text) if text.len() > OFFLOAD_JSON_BYTES => {
-                        let client = self.clone();
-                        std::thread::spawn(move || client.dispatch(frame));
-                    }
-                    _ => self.dispatch(frame),
-                },
-                None => return Ok(()),
-            }
-        }
-    }
-
-    async fn heartbeat(&self) -> Result<()> {
-        let mut failures = 0;
-        loop {
-            Delay::new(HEARTBEAT_INTERVAL).await;
-            match self
-                .request_within(ping_request(&new_id()), Some(HEARTBEAT_TIMEOUT))
-                .await
-            {
-                Ok(_) | Err(PaseoError::Rpc(_)) => failures = 0,
-                Err(PaseoError::Timeout) => {
-                    failures += 1;
-                    if failures >= HEARTBEAT_FAILURE_THRESHOLD {
-                        return Err(PaseoError::Timeout);
+        let writer = async {
+            while let Ok(outgoing) = outgoing.recv_async().await {
+                match outgoing {
+                    Outgoing::Frame(frame) => sink.send(wire.encode(frame)?).await?,
+                    Outgoing::Close => {
+                        sink.send(Message::Close(None)).await?;
+                        return Ok(());
                     }
                 }
-                Err(err) => return Err(err),
             }
-        }
-    }
-
-    async fn request(&self, message: Value) -> Result<Value> {
-        self.request_within(message, Some(REQUEST_TIMEOUT)).await
-    }
-
-    async fn request_within(&self, message: Value, timeout: Option<Duration>) -> Result<Value> {
-        let request_id = message
-            .get("requestId")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| PaseoError::Protocol("request missing requestId".into()))?;
-
-        let (tx, rx) = oneshot::channel();
-        self.inner.pending.lock().insert(request_id.clone(), tx);
-
-        let envelope = session_envelope(message).to_string();
-        let exchange = async {
-            self.inner.transport.send_text(envelope).await?;
-            rx.await.map_err(|_| PaseoError::Closed)?
+            Ok(())
         };
-        let result = match timeout {
-            Some(timeout) => timed(exchange, timeout).await.and_then(|result| result),
-            None => exchange.await,
-        };
-        if result.is_err() {
-            self.inner.pending.lock().remove(&request_id);
-        }
-        result
-    }
-
-    pub async fn fetch_agents(&self) -> Result<Vec<AgentListEntry>> {
-        let id = new_id();
-        let payload = self.request(agents::fetch_agents_request(&id)).await?;
-        let entries = payload.get("entries").cloned().unwrap_or(Value::Null);
-        Ok(serde_json::from_value(entries).unwrap_or_default())
-    }
-
-    pub async fn fetch_agents_raw(&self) -> Result<Vec<Value>> {
-        let id = new_id();
-        let payload = self.request(agents::fetch_agents_request(&id)).await?;
-        let entries = payload
-            .get("entries")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        Ok(entries)
-    }
-
-    pub async fn fetch_agent_timeline(
-        &self,
-        agent_id: &str,
-        direction: &str,
-        limit: u32,
-    ) -> Result<Vec<crate::protocol::TimelineItem>> {
-        let id = new_id();
-        let payload = self
-            .request(agents::fetch_agent_timeline_request(
-                &id, agent_id, direction, limit,
-            ))
-            .await?;
-        let items = payload
-            .get("entries")
-            .and_then(Value::as_array)
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter_map(|entry| entry.get("item").cloned())
-                    .filter_map(|item| serde_json::from_value(item).ok())
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok(items)
-    }
-
-    pub async fn fetch_agent_timeline_page(
-        &self,
-        agent_id: &str,
-        direction: &str,
-        limit: u32,
-        cursor: Option<Value>,
-    ) -> Result<Value> {
-        let id = new_id();
-        self.request(agents::fetch_agent_timeline_page_request(
-            &id,
-            agent_id,
-            direction,
-            limit,
-            cursor.as_ref(),
-        ))
-        .await
-    }
-
-    pub async fn list_provider_subagents(
-        &self,
-        parent_agent_id: &str,
-    ) -> Result<Vec<crate::protocol::subagents::ProviderSubagent>> {
-        let id = new_id();
-        let payload = self
-            .request(subagents::list_request(&id, parent_agent_id))
-            .await?;
-        Ok(subagents::parse_list(&payload))
-    }
-
-    pub async fn fetch_provider_subagent_timeline(
-        &self,
-        parent_agent_id: &str,
-        subagent_id: &str,
-        direction: &str,
-        limit: u32,
-    ) -> Result<Vec<crate::protocol::TimelineItem>> {
-        let id = new_id();
-        let payload = self
-            .request(subagents::timeline_request(
-                &id,
-                parent_agent_id,
-                subagent_id,
-                direction,
-                limit,
-            ))
-            .await?;
-        Ok(subagents::parse_timeline(&payload))
-    }
-
-    pub async fn subscribe_agents(&self) -> Result<()> {
-        let id = new_id();
-        self.request(agents::subscribe_agents_request(&id, "wezterm-paseo"))
-            .await?;
-        Ok(())
-    }
-
-    pub async fn set_timeline_subscription(&self, agent_ids: &[String]) -> Result<()> {
-        if !self.feature_enabled("selectiveAgentTimeline") {
-            return Ok(());
-        }
-        let id = new_id();
-        self.request(agents::set_timeline_subscription_request(&id, agent_ids))
-            .await?;
-        Ok(())
-    }
-
-    pub async fn subscribe_checkout_diff(
-        &self,
-        cwd: &str,
-        mode: &str,
-        base_ref: Option<&str>,
-    ) -> Result<crate::protocol::diff::CheckoutDiff> {
-        let id = new_id();
-        let subscription_id = new_id();
-        let payload = self
-            .request(diff::subscribe_checkout_diff_request(
-                &id,
-                &subscription_id,
-                cwd,
-                mode,
-                base_ref,
-            ))
-            .await?;
-        Ok(diff::parse_checkout_diff(&payload))
-    }
-
-    pub async fn checkout_status(
-        &self,
-        cwd: &str,
-    ) -> Result<crate::protocol::diff::CheckoutStatus> {
-        let id = new_id();
-        let payload = self
-            .request(diff::checkout_status_request(&id, cwd))
-            .await?;
-        Ok(diff::parse_checkout_status(&payload))
-    }
-
-    pub async fn unsubscribe_checkout_diff(&self, subscription_id: &str) -> Result<()> {
-        let message = diff::unsubscribe_checkout_diff_request(subscription_id);
-        self.inner
-            .transport
-            .send_text(session_envelope(message).to_string())
-            .await
-    }
-
-    pub async fn send_agent_message(&self, agent_id: &str, text: &str) -> Result<()> {
-        let id = new_id();
-        self.request(agents::send_agent_message_request(&id, agent_id, text))
-            .await?;
-        Ok(())
-    }
-
-    pub async fn fetch_agent(&self, agent_id: &str) -> Result<crate::protocol::AgentSnapshot> {
-        let id = new_id();
-        let payload = self
-            .request(agents::fetch_agent_request(&id, agent_id))
-            .await?;
-        let agent = payload
-            .get("agent")
-            .cloned()
-            .ok_or_else(|| PaseoError::Protocol("fetch_agent missing agent".into()))?;
-        serde_json::from_value(agent).map_err(PaseoError::from)
-    }
-
-    pub async fn create_agent(
-        &self,
-        provider: &str,
-        cwd: &str,
-        workspace_id: Option<&str>,
-        initial_prompt: Option<&str>,
-        attachments: &[agents::TextAttachment],
-    ) -> Result<crate::protocol::AgentSnapshot> {
-        let id = new_id();
-        let mut message = serde_json::json!({
-            "type": "create_agent_request",
-            "requestId": id,
-            "config": { "provider": provider, "cwd": cwd },
-            "labels": {}
-        });
-        if let Some(workspace_id) = workspace_id {
-            message["workspaceId"] = Value::from(workspace_id);
-        }
-        if let Some(initial_prompt) = initial_prompt {
-            message["initialPrompt"] = Value::from(initial_prompt);
-        }
-        if !attachments.is_empty() {
-            message["attachments"] = serde_json::to_value(attachments).map_err(PaseoError::from)?;
-        }
-        let payload = self.request(message).await?;
-        match payload.get("status").and_then(Value::as_str) {
-            Some("agent_created") => {
-                let agent = payload
-                    .get("agent")
-                    .cloned()
-                    .ok_or_else(|| PaseoError::Protocol("agent_created missing agent".into()))?;
-                serde_json::from_value(agent).map_err(PaseoError::from)
+        let liveness = async {
+            loop {
+                Timer::after(LIVENESS_INTERVAL).await;
+                pongs.drain();
+                self.inner.send(Frame::Text(PING.to_owned()))?;
+                if timed(pongs.recv_async(), LIVENESS_TIMEOUT).await.is_some() {
+                    continue;
+                }
+                let failures = self.inner.liveness_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                if failures >= LIVENESS_FAILURE_THRESHOLD {
+                    return Err(PaseoError::LivenessTimeout);
+                }
             }
-            _ => Err(PaseoError::Rpc(
-                payload
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .unwrap_or("create_agent failed")
-                    .to_owned(),
-            )),
-        }
-    }
-
-    fn resumed_agent(payload: &Value) -> Result<crate::protocol::AgentSnapshot> {
-        match payload.get("status").and_then(Value::as_str) {
-            Some("agent_resumed") => {
-                let agent = payload
-                    .get("agent")
-                    .cloned()
-                    .ok_or_else(|| PaseoError::Protocol("agent_resumed missing agent".into()))?;
-                serde_json::from_value(agent).map_err(PaseoError::from)
-            }
-            _ => Err(PaseoError::Rpc(
-                payload
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .unwrap_or("resume failed")
-                    .to_owned(),
-            )),
-        }
-    }
-
-    fn ensure_ok(payload: &Value) -> Result<()> {
-        match payload.get("error").and_then(Value::as_str) {
-            Some(error) if !error.is_empty() => Err(PaseoError::Rpc(error.to_owned())),
-            _ => Ok(()),
-        }
-    }
-
-    pub async fn resume_agent(
-        &self,
-        handle: &agents::AgentPersistenceHandle,
-        overrides: Option<&Value>,
-    ) -> Result<crate::protocol::AgentSnapshot> {
-        let id = new_id();
-        let payload = self
-            .request(agents::resume_agent_request(&id, handle, overrides))
-            .await?;
-        Self::resumed_agent(&payload)
-    }
-
-    pub async fn import_agent(
-        &self,
-        request: &agents::ImportAgentRequest,
-    ) -> Result<crate::protocol::AgentSnapshot> {
-        let id = new_id();
-        let payload = self
-            .request(agents::import_agent_request(&id, request))
-            .await?;
-        Self::resumed_agent(&payload)
-    }
-
-    pub async fn refresh_agent(&self, agent_id: &str) -> Result<()> {
-        let id = new_id();
-        let payload = self
-            .request(agents::refresh_agent_request(&id, agent_id))
-            .await?;
-        Self::ensure_ok(&payload)
-    }
-
-    pub async fn update_agent(
-        &self,
-        agent_id: &str,
-        name: Option<&str>,
-        labels: Option<&HashMap<String, String>>,
-    ) -> Result<()> {
-        let id = new_id();
-        let payload = self
-            .request(agents::update_agent_request(&id, agent_id, name, labels))
-            .await?;
-        Self::ensure_ok(&payload)
-    }
-
-    pub async fn detach_agent(&self, agent_id: &str) -> Result<()> {
-        let id = new_id();
-        let payload = self
-            .request(agents::detach_agent_request(&id, agent_id))
-            .await?;
-        Self::ensure_ok(&payload)
-    }
-
-    pub async fn rewind_agent(
-        &self,
-        agent_id: &str,
-        message_id: &str,
-        mode: agents::RewindMode,
-    ) -> Result<()> {
-        let id = new_id();
-        let payload = self
-            .request(agents::rewind_agent_request(
-                &id, agent_id, message_id, mode,
-            ))
-            .await?;
-        Self::ensure_ok(&payload)
-    }
-
-    pub async fn wait_for_finish(
-        &self,
-        agent_id: &str,
-        timeout_ms: Option<u32>,
-    ) -> Result<agents::WaitOutcome> {
-        let id = new_id();
-        let payload = self
-            .request_within(
-                agents::wait_for_finish_request(&id, agent_id, timeout_ms),
-                timeout_ms.map(|ms| Duration::from_millis(u64::from(ms)) + REQUEST_TIMEOUT),
-            )
-            .await?;
-        serde_json::from_value(payload).map_err(PaseoError::from)
-    }
-
-    pub async fn list_prompts(&self, agent_id: &str) -> Result<Vec<agents::PromptPreview>> {
-        let id = new_id();
-        let payload = self
-            .request(agents::list_prompts_request(&id, agent_id))
-            .await?;
-        Self::ensure_ok(&payload)?;
-        let prompts = payload
-            .get("prompts")
-            .cloned()
-            .map(serde_json::from_value)
-            .transpose()?
-            .unwrap_or_default();
-        Ok(prompts)
-    }
-
-    pub async fn fork_context(
-        &self,
-        agent_id: &str,
-        boundary_message_id: Option<&str>,
-    ) -> Result<agents::ForkedContext> {
-        let id = new_id();
-        let payload = self
-            .request(agents::fork_context_request(
-                &id,
-                agent_id,
-                boundary_message_id,
-            ))
-            .await?;
-        Self::ensure_ok(&payload)?;
-        serde_json::from_value(payload).map_err(PaseoError::from)
-    }
-
-    pub async fn list_available_providers(&self) -> Result<Vec<String>> {
-        let id = new_id();
-        let payload = self
-            .request(serde_json::json!({
-                "type": "list_available_providers_request",
-                "requestId": id
-            }))
-            .await?;
-        let providers = payload
-            .get("providers")
-            .and_then(Value::as_array)
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter(|entry| {
-                        entry
-                            .get("available")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false)
-                    })
-                    .filter_map(|entry| {
-                        entry
-                            .get("provider")
-                            .and_then(Value::as_str)
-                            .map(String::from)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok(providers)
-    }
-
-    pub async fn cancel_agent(&self, agent_id: &str) -> Result<()> {
-        let id = new_id();
-        self.request(agents::cancel_agent_request(&id, agent_id))
-            .await?;
-        Ok(())
-    }
-
-    pub async fn archive_agent(&self, agent_id: &str) -> Result<()> {
-        let id = new_id();
-        self.request(agents::archive_agent_request(&id, agent_id))
-            .await?;
-        Ok(())
-    }
-
-    pub async fn delete_agent(&self, agent_id: &str) -> Result<()> {
-        let id = new_id();
-        self.request(agents::delete_agent_request(&id, agent_id))
-            .await?;
-        Ok(())
-    }
-
-    pub async fn set_agent_mode(&self, agent_id: &str, mode_id: &str) -> Result<()> {
-        let id = new_id();
-        self.request(agents::set_agent_mode_request(&id, agent_id, mode_id))
-            .await?;
-        Ok(())
-    }
-
-    pub async fn set_agent_model(&self, agent_id: &str, model_id: &str) -> Result<()> {
-        let id = new_id();
-        self.request(agents::set_agent_model_request(&id, agent_id, model_id))
-            .await?;
-        Ok(())
-    }
-
-    pub async fn set_agent_feature(
-        &self,
-        agent_id: &str,
-        feature_id: &str,
-        value: Value,
-    ) -> Result<()> {
-        let id = new_id();
-        self.request(agents::set_agent_feature_request(
-            &id, agent_id, feature_id, value,
-        ))
-        .await?;
-        Ok(())
-    }
-
-    pub async fn list_commands(&self, agent_id: &str) -> Result<Vec<agents::SlashCommand>> {
-        let id = new_id();
-        let payload = self
-            .request(agents::list_commands_request(&id, agent_id))
-            .await?;
-        let commands = payload
-            .get("commands")
-            .cloned()
-            .map(serde_json::from_value)
-            .transpose()?
-            .unwrap_or_default();
-        Ok(commands)
-    }
-
-    pub async fn set_agent_thinking(&self, agent_id: &str, thinking_option_id: &str) -> Result<()> {
-        let id = new_id();
-        self.request(agents::set_agent_thinking_request(
-            &id,
-            agent_id,
-            thinking_option_id,
-        ))
-        .await?;
-        Ok(())
-    }
-
-    pub async fn list_provider_models(
-        &self,
-        provider: &str,
-        cwd: Option<&str>,
-    ) -> Result<Vec<crate::protocol::agents::ModelDefinition>> {
-        let id = new_id();
-        let payload = self
-            .request_within(
-                agents::list_provider_models_request(&id, provider, cwd),
-                Some(PROVIDER_MODELS_TIMEOUT),
-            )
-            .await?;
-        let models = payload.get("models").cloned().unwrap_or(Value::Null);
-        Ok(serde_json::from_value(models).unwrap_or_default())
-    }
-
-    pub async fn respond_permission(
-        &self,
-        agent_id: &str,
-        request_id: &str,
-        response: PermissionResponse,
-    ) -> Result<()> {
-        let message = agents::permission_response_message(agent_id, request_id, &response);
-        self.inner
-            .transport
-            .send_text(session_envelope(message).to_string())
-            .await
-    }
-
-    pub async fn fetch_workspaces(&self) -> Result<Vec<crate::protocol::workspaces::Workspace>> {
-        let id = new_id();
-        let payload = self
-            .request(crate::protocol::workspaces::fetch_workspaces_request(&id))
-            .await?;
-        let entries = payload.get("entries").cloned().unwrap_or(Value::Null);
-        Ok(serde_json::from_value(entries).unwrap_or_default())
-    }
-
-    pub async fn project_add(&self, cwd: &str) -> Result<()> {
-        let id = new_id();
-        self.request(crate::protocol::workspaces::project_add_request(&id, cwd))
-            .await?;
-        Ok(())
-    }
-
-    pub async fn project_create_directory(&self, parent_path: &str, name: &str) -> Result<String> {
-        let id = new_id();
-        let payload = self
-            .request(
-                crate::protocol::workspaces::project_create_directory_request(
-                    &id,
-                    parent_path,
-                    name,
-                ),
-            )
-            .await?;
-        if let Some(error) = payload.get("error").and_then(Value::as_str) {
-            return Err(PaseoError::Rpc(error.to_owned()));
-        }
-        payload
-            .get("directoryPath")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| PaseoError::Protocol("create_directory missing directoryPath".into()))
-    }
-
-    pub async fn write_text_file(
-        &self,
-        cwd: &str,
-        parent_path: &str,
-        name: &str,
-        content: &str,
-    ) -> Result<String> {
-        if parent_path != "." && !parent_path.is_empty() {
-            let _ = self
-                .fs_entry_create(cwd, ".", parent_path, "directory")
-                .await;
-        }
-        let path = self.fs_entry_create(cwd, parent_path, name, "file").await?;
-        let expected = match self.fs_file_write(cwd, &path, content, "").await? {
-            FileWrite::Written => return Ok(path),
-            FileWrite::Conflict { modified_at } => modified_at.ok_or_else(|| {
-                PaseoError::Protocol("file write conflict missing modifiedAt".into())
-            })?,
         };
-        match self.fs_file_write(cwd, &path, content, &expected).await? {
-            FileWrite::Written => Ok(path),
-            FileWrite::Conflict { .. } => Err(PaseoError::Rpc("file write conflict".into())),
-        }
-    }
-
-    async fn fs_entry_create(
-        &self,
-        cwd: &str,
-        parent_path: &str,
-        name: &str,
-        kind: &str,
-    ) -> Result<String> {
-        let id = new_id();
-        let payload = self
-            .request(serde_json::json!({
-                "type": "fs.entry.create.request",
-                "cwd": cwd,
-                "parentPath": parent_path,
-                "name": name,
-                "kind": kind,
-                "requestId": id,
-            }))
-            .await?;
-        if let Some(error) = payload.get("error").and_then(Value::as_str) {
-            return Err(PaseoError::Rpc(error.to_owned()));
-        }
-        payload
-            .get("path")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| PaseoError::Protocol("entry.create missing path".into()))
-    }
-
-    async fn fs_file_write(
-        &self,
-        cwd: &str,
-        path: &str,
-        content: &str,
-        expected_modified_at: &str,
-    ) -> Result<FileWrite> {
-        let id = new_id();
-        let payload = self
-            .request(serde_json::json!({
-                "type": "fs.file.write.request",
-                "cwd": cwd,
-                "path": path,
-                "content": content,
-                "expectedModifiedAt": expected_modified_at,
-                "requestId": id,
-            }))
-            .await?;
-        let result = payload.get("result").cloned().unwrap_or(Value::Null);
-        match result.get("status").and_then(Value::as_str) {
-            Some("written") => Ok(FileWrite::Written),
-            Some("conflict") => Ok(FileWrite::Conflict {
-                modified_at: result
-                    .get("version")
-                    .and_then(|version| version.get("modifiedAt"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-            }),
-            Some("error") => Err(PaseoError::Rpc(
-                result
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .unwrap_or("file write error")
-                    .to_owned(),
-            )),
-            _ => Err(PaseoError::Protocol("file write missing status".into())),
-        }
-    }
-
-    pub async fn directory_suggestions(&self, query: &str, limit: u32) -> Result<Vec<String>> {
-        let id = new_id();
-        let payload = self
-            .request(crate::protocol::workspaces::directory_suggestions_request(
-                &id, query, limit,
-            ))
-            .await?;
-        if let Some(error) = payload.get("error").and_then(Value::as_str) {
-            return Err(PaseoError::Rpc(error.to_owned()));
-        }
-        let directories = payload
-            .get("directories")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| item.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok(directories)
-    }
-
-    pub async fn branch_suggestions(
-        &self,
-        cwd: &str,
-        query: &str,
-        limit: u32,
-    ) -> Result<Vec<String>> {
-        let id = new_id();
-        let payload = self
-            .request(crate::protocol::workspaces::branch_suggestions_request(
-                &id, cwd, query, limit,
-            ))
-            .await?;
-        if let Some(error) = payload.get("error").and_then(Value::as_str) {
-            return Err(PaseoError::Rpc(error.to_owned()));
-        }
-        let branches = payload
-            .get("branches")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| item.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok(branches)
-    }
-
-    async fn workspace_create(&self, request: Value) -> Result<CreatedWorkspace> {
-        let payload = self.request(request).await?;
-        if let Some(error) = payload.get("error").and_then(Value::as_str) {
-            return Err(PaseoError::Rpc(error.to_owned()));
-        }
-        let workspace = payload.get("workspace").filter(|value| !value.is_null());
-        let workspace = workspace
-            .ok_or_else(|| PaseoError::Protocol("workspace.create returned no workspace".into()))?;
-        let id = workspace
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| PaseoError::Protocol("workspace.create missing id".into()))?;
-        let cwd = workspace
-            .get("workspaceDirectory")
-            .and_then(Value::as_str)
-            .or_else(|| workspace.get("projectRootPath").and_then(Value::as_str))
-            .map(str::to_string)
-            .ok_or_else(|| PaseoError::Protocol("workspace.create missing directory".into()))?;
-        Ok(CreatedWorkspace { id, cwd })
-    }
-
-    pub async fn workspace_create_directory(&self, path: &str) -> Result<CreatedWorkspace> {
-        let id = new_id();
-        self.workspace_create(
-            crate::protocol::workspaces::workspace_create_directory_request(&id, path),
+        match future::select(
+            pin!(reader),
+            pin!(future::select(pin!(writer), pin!(liveness))),
         )
         .await
-    }
-
-    pub async fn workspace_create_worktree(
-        &self,
-        cwd: &str,
-        action: &str,
-        ref_name: Option<&str>,
-        base_branch: Option<&str>,
-        branch_name: Option<&str>,
-    ) -> Result<CreatedWorkspace> {
-        let id = new_id();
-        self.workspace_create(
-            crate::protocol::workspaces::workspace_create_worktree_request(
-                &id,
-                cwd,
-                action,
-                ref_name,
-                base_branch,
-                branch_name,
-            ),
-        )
-        .await
-    }
-
-    pub async fn project_github_clone(
-        &self,
-        repo: &str,
-        protocol: &str,
-        target_directory: &str,
-    ) -> Result<String> {
-        let id = new_id();
-        let payload = self
-            .request_within(
-                crate::protocol::workspaces::project_github_clone_request(
-                    &id,
-                    repo,
-                    protocol,
-                    target_directory,
-                ),
-                Some(GITHUB_CLONE_TIMEOUT),
-            )
-            .await?;
-        if let Some(error) = payload.get("error").and_then(Value::as_str) {
-            return Err(PaseoError::Rpc(error.to_owned()));
+        {
+            Either::Left((result, _)) => result,
+            Either::Right((Either::Left((result, _)) | Either::Right((result, _)), _)) => result,
         }
-        payload
-            .get("project")
-            .and_then(|p| p.get("projectRootPath"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| {
-                PaseoError::Protocol("github clone missing project.projectRootPath".into())
-            })
+    }
+}
+
+struct Disconnect<'a> {
+    inner: &'a Inner,
+}
+
+impl Drop for Disconnect<'_> {
+    fn drop(&mut self) {
+        self.inner.disconnect();
+    }
+}
+
+impl Inner {
+    pub(crate) fn send(&self, frame: Frame) -> Result<(), PaseoError> {
+        self.outgoing
+            .send(Outgoing::Frame(frame))
+            .map_err(|_| PaseoError::Closed)
     }
 
-    pub async fn open_project(&self, cwd: &str) -> Result<String> {
-        let id = new_id();
-        let payload = self
-            .request(serde_json::json!({
-                "type": "open_project_request",
-                "cwd": cwd,
-                "requestId": id
-            }))
-            .await?;
-        if let Some(err) = payload.get("error").and_then(Value::as_str) {
-            return Err(PaseoError::Rpc(err.to_owned()));
+    fn disconnect(&self) {
+        let mut state = self.state.lock();
+        state.connected = false;
+        for (_, pending) in state.pending.drain() {
+            pending.reply.send(Err(PaseoError::Closed)).ok();
         }
-        payload
-            .get("workspace")
-            .and_then(|workspace| workspace.get("id"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| {
-                PaseoError::Protocol("open_project_response missing workspace.id".into())
-            })
-    }
-
-    pub async fn list_terminals(&self, cwd: Option<&str>) -> Result<Vec<TerminalInfo>> {
-        let id = new_id();
-        let payload = self
-            .request(terminals::list_terminals_request(&id, cwd))
-            .await?;
-        Ok(terminals::parse_terminal_list(&payload))
-    }
-
-    pub async fn create_terminal(
-        &self,
-        cwd: &str,
-        opts: CreateTerminalOpts,
-    ) -> Result<TerminalInfo> {
-        let id = new_id();
-        let payload = self
-            .request(terminals::create_terminal_request(&id, cwd, &opts))
-            .await?;
-        if let Some(err) = payload.get("error").and_then(Value::as_str) {
-            return Err(PaseoError::Rpc(err.to_owned()));
+        state.routes.clear();
+        state.terminal_slots.clear();
+        state.creations.clear();
+        for (_, channel) in state.channels.drain() {
+            channel.disconnect();
         }
-        let terminal = payload.get("terminal").cloned().ok_or_else(|| {
-            PaseoError::Protocol("create_terminal_response missing terminal".into())
-        })?;
-        serde_json::from_value(terminal).map_err(PaseoError::from)
-    }
-
-    pub async fn subscribe_terminal(
-        &self,
-        terminal_id: &str,
-        restore_mode: &str,
-    ) -> Result<TerminalHandle> {
-        let id = new_id();
-        let payload = self
-            .request(terminals::subscribe_terminal_request(
-                &id,
-                terminal_id,
-                restore_mode,
-            ))
-            .await?;
-        let slot = terminals::parse_subscribe_slot(&payload)?;
-
-        let (tx, rx) = flume::unbounded();
-        self.inner.terminals.lock().insert(slot, tx);
-        self.inner
-            .terminal_slots
-            .lock()
-            .insert(terminal_id.to_owned(), slot);
-
-        Ok(TerminalHandle {
-            terminal_id: terminal_id.to_owned(),
-            slot,
-            transport: self.inner.transport.clone(),
-            owner: self.clone(),
-            output_rx: rx,
-        })
-    }
-
-    pub async fn kill_terminal(&self, terminal_id: &str) -> Result<()> {
-        let id = new_id();
-        self.request(terminals::kill_terminal_request(&id, terminal_id))
-            .await?;
-        Ok(())
-    }
-
-    pub async fn close(&self) {
-        self.inner.transport.close().await;
     }
 
     fn dispatch(&self, frame: Frame) {
         match frame {
-            Frame::Json(text) => match parse_top_level(&text) {
-                Ok(Incoming::Session(message)) => self.dispatch_session(message),
-                Ok(Incoming::Pong) | Ok(Incoming::Unknown(_)) => {}
-                Err(_) => {}
-            },
+            Frame::Text(text) => self.dispatch_text(&text),
             Frame::Binary(bytes) => self.dispatch_binary(&bytes),
         }
     }
 
-    fn dispatch_session(&self, message: Value) {
-        let ty = session_message_type(&message).to_owned();
-        let payload = message.get("payload").cloned().unwrap_or(Value::Null);
-
-        if let Some(request_id) = session_request_id(&message) {
-            let waiter = self.inner.pending.lock().remove(&request_id);
-            if let Some(tx) = waiter {
-                if ty == "rpc_error" {
-                    let err = payload
-                        .get("error")
-                        .and_then(Value::as_str)
-                        .unwrap_or("rpc error")
-                        .to_owned();
-                    let _ = tx.send(Err(PaseoError::Rpc(err)));
-                } else {
-                    let _ = tx.send(Ok(payload));
-                }
+    fn dispatch_text(&self, text: &str) {
+        let envelope = match serde_json::from_str::<Envelope<'_>>(text) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                log::warn!("dropping an undecodable daemon message: {error}");
                 return;
             }
+        };
+        if envelope.kind == "pong" {
+            self.pongs.try_send(()).ok();
+            return;
         }
+        let Some(message) = envelope.message.filter(|_| envelope.kind == "session") else {
+            return;
+        };
+        let heads = serde_json::from_str::<MessageHead<'_>>(message.get()).and_then(|head| {
+            let payload_head = match head.payload {
+                Some(payload) => serde_json::from_str::<PayloadHead<'_>>(payload.get())?,
+                None => PayloadHead::default(),
+            };
+            Ok((head, payload_head))
+        });
+        let (head, payload_head) = match heads {
+            Ok(heads) => heads,
+            Err(error) => {
+                self.fail_undecodable(message, error);
+                return;
+            }
+        };
+        if head.kind == "subscription.release.response" {
+            return;
+        }
+        let mut state = self.state.lock();
+        if let Some(request_id) = payload_head.request_id.as_deref()
+            && let Entry::Occupied(entry) = state.pending.entry(request_id.to_owned())
+            && (head.kind == entry.get().response_type || head.kind == "rpc_error")
+        {
+            let pending = entry.remove();
+            let reply = Self::reply(
+                &mut state,
+                pending.registration,
+                &head,
+                &payload_head,
+                pending.request_type,
+            );
+            pending.reply.send(reply).ok();
+            return;
+        }
+        if let Some(subscription_id) = payload_head.subscription_id.as_deref() {
+            match state
+                .routes
+                .get(subscription_id)
+                .map(|route| route.deliver.clone())
+            {
+                Some(deliver) => {
+                    drop(state);
+                    deliver(&head.kind, message);
+                }
+                None if payload_head.request_id.is_some() => {
+                    drop(state);
+                    self.release(subscription_id);
+                }
+                None => {}
+            }
+            return;
+        }
+        if head.kind != "agent.create.update" {
+            return;
+        }
+        let Some(payload) = head.payload else {
+            return;
+        };
+        let key = match serde_json::from_str::<CreationKey<'_>>(payload.get()) {
+            Ok(key) => key,
+            Err(error) => {
+                log::warn!("dropping an agent creation update without its key: {error}");
+                return;
+            }
+        };
+        if let Some(updates) = state.creations.get(key.idempotency_key.as_ref()) {
+            let snapshot = serde_json::from_str::<CreationSnapshot>(payload.get())
+                .map_err(|error| PaseoError::decode(head.kind.as_ref(), error));
+            updates.send(snapshot).ok();
+        }
+    }
 
-        match ty.as_str() {
-            "agent_update" => {
-                if let Ok(update) = serde_json::from_value::<AgentUpdate>(payload) {
-                    match update.kind.as_str() {
-                        "remove" => {
-                            if let Some(id) = update.agent_id {
-                                self.emit(DaemonEvent::AgentRemove(id));
-                            }
-                        }
-                        _ => {
-                            if let Some(agent) = update.agent {
-                                self.emit(DaemonEvent::AgentUpsert(Box::new(agent)));
-                            }
-                        }
-                    }
-                }
+    fn fail_undecodable(&self, message: &RawValue, error: serde_json::Error) {
+        let value = serde_json::from_str::<Value>(message.get()).ok();
+        let field = |pointer: &str| {
+            value
+                .as_ref()
+                .and_then(|value| value.pointer(pointer))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        };
+        let kind = field("/type").unwrap_or_else(|| "session message".to_owned());
+        let pending = field("/payload/requestId")
+            .and_then(|request_id| self.state.lock().pending.remove(&request_id));
+        match pending {
+            Some(pending) => {
+                pending
+                    .reply
+                    .send(Err(PaseoError::decode(kind, error)))
+                    .ok();
             }
-            "agent_stream" => {
-                let agent_id = payload
-                    .get("agentId")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned();
-                if let Some(event) = payload.get("event").cloned() {
-                    if let Ok(event) = serde_json::from_value::<AgentStreamEvent>(event) {
-                        self.emit(DaemonEvent::AgentStream {
-                            agent_id,
-                            event: Box::new(event),
-                        });
-                    }
-                }
-            }
-            "agent_permission_request" => {
-                let agent_id = payload
-                    .get("agentId")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned();
-                if let Some(request) = payload.get("request").cloned() {
-                    if let Ok(request) = serde_json::from_value(request) {
-                        self.emit(DaemonEvent::PermissionRequest {
-                            agent_id,
-                            request: Box::new(request),
-                        });
-                    }
-                }
-            }
-            "terminals_changed" => {
-                let terminals = terminals::parse_terminal_list(&payload);
-                self.emit(DaemonEvent::TerminalsChanged { terminals });
-            }
-            "terminal_stream_exit" => {
-                if let Some(terminal_id) = payload.get("terminalId").and_then(Value::as_str) {
-                    if let Some(slot) = self.inner.terminal_slots.lock().remove(terminal_id) {
-                        self.inner.terminals.lock().remove(&slot);
-                    }
-                    self.emit(DaemonEvent::TerminalExit(terminal_id.to_owned()));
-                }
-            }
-            "agent.provider_subagents.update" => {
-                if let Some(update) = subagents::parse_update(&payload) {
-                    self.emit(DaemonEvent::Subagent(Box::new(update)));
-                }
-            }
-            "checkout_diff_update" => {
-                let diff = diff::parse_checkout_diff(&payload);
-                self.emit(DaemonEvent::CheckoutDiff(Box::new(diff)));
-            }
-            _ => {}
+            None => log::warn!("dropping an undecodable {kind}: {error}"),
         }
+    }
+
+    fn reply(
+        state: &mut State,
+        registration: Option<Registration>,
+        head: &MessageHead<'_>,
+        payload_head: &PayloadHead<'_>,
+        request_type: &'static str,
+    ) -> Reply {
+        let payload = head.payload.ok_or_else(|| {
+            PaseoError::decode(
+                head.kind.as_ref(),
+                serde_json::Error::missing_field("payload"),
+            )
+        })?;
+        if head.kind == "rpc_error" {
+            let error = serde_json::from_str::<RpcError>(payload.get())
+                .map_err(|error| PaseoError::decode("rpc_error", error))?;
+            return Err(PaseoError::Rpc(error.with_request_type(request_type)));
+        }
+        if let Some(registration) = registration {
+            registration(state, payload_head, payload)?;
+        }
+        Ok(payload.to_owned())
     }
 
     fn dispatch_binary(&self, bytes: &[u8]) {
-        let Some(frame) = binary_frames::decode(bytes) else {
+        if let Some(frame) = ChannelFrame::decode(bytes) {
+            let channel = self.state.lock().channels.get(&frame.channel).cloned();
+            if let Some(channel) = channel {
+                channel.receive(&frame);
+            }
+            return;
+        }
+        let Some(frame) = TerminalFrame::decode(bytes) else {
             return;
         };
-        let senders = self.inner.terminals.lock();
-        let Some(tx) = senders.get(&frame.slot) else {
+        let state = self.state.lock();
+        let Some(SlotOwner { events, .. }) = state.terminal_slots.get(&frame.slot) else {
             return;
         };
         let event = match frame.opcode {
-            Opcode::Output => TerminalStreamEvent::Output(frame.payload),
-            Opcode::Restore => TerminalStreamEvent::Restore(frame.payload),
-            Opcode::Snapshot => TerminalStreamEvent::Snapshot(
-                serde_json::from_slice(&frame.payload).unwrap_or(Value::Null),
-            ),
+            Opcode::Output => Ok(TerminalStreamEvent::Output(frame.payload.to_vec())),
+            Opcode::Restore => Ok(TerminalStreamEvent::Restore(frame.payload.to_vec())),
+            Opcode::Snapshot => serde_json::from_slice(frame.payload)
+                .map(TerminalStreamEvent::Snapshot)
+                .map_err(|error| PaseoError::decode("terminal snapshot", error)),
             Opcode::Input | Opcode::Resize => return,
         };
-        let _ = tx.send(event);
+        events.send(event).ok();
     }
 
-    fn emit(&self, event: DaemonEvent) {
-        let _ = self.inner.events_tx.try_broadcast(event);
-    }
-}
-
-impl TerminalHandle {
-    pub fn terminal_id(&self) -> &str {
-        &self.terminal_id
-    }
-
-    pub fn output(&self) -> flume::Receiver<TerminalStreamEvent> {
-        self.output_rx.clone()
-    }
-
-    pub fn writer(&self) -> TerminalWriter {
-        TerminalWriter {
-            transport: self.transport.clone(),
-            slot: self.slot,
+    pub(crate) fn release(&self, subscription_id: &str) {
+        let mut state = self.state.lock();
+        if let Some(route) = state.routes.remove(subscription_id) {
+            if let Some(slot) = route.terminal_slot
+                && state
+                    .terminal_slots
+                    .get(&slot)
+                    .is_some_and(|owner| owner.subscription_id == subscription_id)
+            {
+                state.terminal_slots.remove(&slot);
+            }
+            if let Some(channel) = route.channel {
+                state.channels.remove(&channel);
+            }
+        }
+        if !state.connected {
+            return;
+        }
+        drop(state);
+        let body = SubscriptionRelease { subscription_id };
+        let text = session_message("subscription.release.request", Some(&new_id()), &body)
+            .expect("a subscription release serialises");
+        if let Err(error) = self.send(Frame::Text(text)) {
+            log::debug!("could not release subscription {subscription_id}: {error}");
         }
     }
 
-    pub async fn send_input(&self, data: &[u8]) -> Result<()> {
-        self.writer().send_input(data).await
+    pub(crate) fn submit<B: Serialize>(
+        self: &Arc<Self>,
+        request: &Request<'_, B>,
+        registration: Option<Registration>,
+    ) -> Result<PendingReply, PaseoError> {
+        let request_id = new_id();
+        let text = session_message(request.kind, Some(&request_id), request.body)?;
+        let (reply, receiver) = oneshot::channel();
+        {
+            let mut state = self.state.lock();
+            if !state.connected {
+                return Err(PaseoError::Closed);
+            }
+            state.pending.insert(
+                request_id.clone(),
+                Pending {
+                    response_type: request.response_type,
+                    request_type: request.kind,
+                    reply,
+                    registration,
+                },
+            );
+        }
+        let pending = PendingReply {
+            request_id,
+            request_type: request.kind,
+            receiver,
+            client: Arc::downgrade(self),
+        };
+        self.send(Frame::Text(text))?;
+        Ok(pending)
     }
 
-    pub async fn resize(&self, rows: u32, cols: u32) -> Result<()> {
-        self.writer().resize(rows, cols).await
+    pub(crate) fn register_creation(&self, key: String, updates: Updates<CreationSnapshot>) {
+        self.state.lock().creations.insert(key, updates);
     }
 
-    pub async fn unsubscribe(self) -> Result<()> {
-        self.owner.inner.terminals.lock().remove(&self.slot);
-        let message = terminals::unsubscribe_terminal_request(&self.terminal_id);
-        self.transport
-            .send_text(session_envelope(message).to_string())
-            .await
+    pub(crate) fn unregister_creation(&self, key: &str) {
+        self.state.lock().creations.remove(key);
+    }
+
+    pub(crate) fn route_registration<U: Routed>(
+        updates: Updates<U>,
+        response_type: &'static str,
+    ) -> Registration {
+        Box::new(move |state, head, _payload| {
+            let id = head
+                .subscription_id
+                .as_deref()
+                .ok_or(ProtocolViolation::MissingSubscriptionId { response_type })?;
+            state.routes.insert(
+                id.to_owned(),
+                Route {
+                    deliver: Self::deliver(updates),
+                    terminal_slot: None,
+                    channel: None,
+                },
+            );
+            Ok(())
+        })
+    }
+
+    pub(crate) fn channel_registration(
+        channel: Arc<dyn ChannelEndpoint>,
+        events: Deliver,
+        request_type: &'static str,
+        response_type: &'static str,
+    ) -> Registration {
+        Box::new(move |state, head, payload| {
+            let opened = serde_json::from_str::<ChannelOpened>(payload.get())
+                .map_err(|error| PaseoError::decode(response_type, error))?;
+            if let Some(error) = opened.error {
+                return Err(PaseoError::rpc(request_type, error));
+            }
+            let id = head
+                .subscription_id
+                .as_deref()
+                .ok_or(ProtocolViolation::MissingSubscriptionId { response_type })?;
+            let number = opened.channel.ok_or_else(|| {
+                PaseoError::decode(response_type, serde_json::Error::missing_field("channel"))
+            })?;
+            channel.open(number);
+            state.channels.insert(number, channel);
+            state.routes.insert(
+                id.to_owned(),
+                Route {
+                    deliver: events,
+                    terminal_slot: None,
+                    channel: Some(number),
+                },
+            );
+            Ok(())
+        })
+    }
+
+    pub(crate) fn terminal_registration(events: Updates<TerminalStreamEvent>) -> Registration {
+        Box::new(move |state, head, payload| {
+            let subscribed = serde_json::from_str::<TerminalSubscribed>(payload.get())
+                .map_err(|error| PaseoError::decode("subscribe_terminal_response", error))?;
+            if let Some(error) = subscribed.error {
+                return Err(PaseoError::rpc("subscribe_terminal_request", error));
+            }
+            let id = head.subscription_id.as_deref().ok_or(
+                ProtocolViolation::MissingSubscriptionId {
+                    response_type: "subscribe_terminal_response",
+                },
+            )?;
+            let slot = subscribed.slot.ok_or_else(|| {
+                PaseoError::decode(
+                    "subscribe_terminal_response",
+                    serde_json::Error::missing_field("slot"),
+                )
+            })?;
+            state.terminal_slots.insert(
+                slot,
+                SlotOwner {
+                    subscription_id: id.to_owned(),
+                    events: events.clone(),
+                },
+            );
+            state.routes.insert(
+                id.to_owned(),
+                Route {
+                    deliver: Self::deliver(events),
+                    terminal_slot: Some(slot),
+                    channel: None,
+                },
+            );
+            Ok(())
+        })
+    }
+
+    fn deliver<U: Routed>(updates: Updates<U>) -> Deliver {
+        Arc::new(move |kind, message| {
+            updates.send(U::decode(kind, message)).ok();
+        })
+    }
+
+    pub(crate) fn send_terminal_frame(
+        &self,
+        opcode: Opcode,
+        slot: u8,
+        payload: &[u8],
+    ) -> Result<(), PaseoError> {
+        let frame = TerminalFrame {
+            opcode,
+            slot,
+            payload,
+        };
+        self.send(Frame::Binary(frame.encode()))
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SubscriptionRelease<'a> {
+    subscription_id: &'a str,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreationKey<'a> {
+    #[serde(borrow)]
+    idempotency_key: Cow<'a, str>,
+}
+
+#[derive(Deserialize)]
+struct ChannelOpened {
+    #[serde(default)]
+    channel: Option<u32>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalSubscribed {
+    #[serde(default)]
+    slot: Option<u8>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct Payload<T> {
+    pub(crate) payload: T,
+}
+
+pub(crate) struct PendingReply {
+    request_id: String,
+    request_type: &'static str,
+    receiver: oneshot::Receiver<Reply>,
+    client: Weak<Inner>,
+}
+
+impl PendingReply {
+    pub(crate) fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    pub(crate) async fn wait(mut self, timeout: Option<Duration>) -> Reply {
+        let receiver = &mut self.receiver;
+        let reply = match timeout {
+            Some(timeout) => timed(receiver, timeout).await.ok_or(PaseoError::Timeout {
+                request_type: self.request_type,
+            })?,
+            None => receiver.await,
+        };
+        reply.map_err(|_| PaseoError::Closed)?
+    }
+}
+
+impl Drop for PendingReply {
+    fn drop(&mut self) {
+        let Some(client) = self.client.upgrade() else {
+            return;
+        };
+        client.state.lock().pending.remove(&self.request_id);
+        let Ok(Some(Ok(payload))) = self.receiver.try_recv() else {
+            return;
+        };
+        if let Ok(head) = serde_json::from_str::<PayloadHead<'_>>(payload.get())
+            && let Some(subscription_id) = head.subscription_id
+        {
+            client.release(&subscription_id);
+        }
+    }
+}
+
+pub(crate) struct Request<'a, B> {
+    pub(crate) kind: &'static str,
+    pub(crate) response_type: &'static str,
+    pub(crate) body: &'a B,
+}
+
+pub struct Subscription<S, U> {
+    id: String,
+    snapshot: S,
+    updates: flume::Receiver<Result<U, PaseoError>>,
+    client: Weak<Inner>,
+}
+
+impl<S, U> Subscription<S, U> {
+    pub(crate) fn new(
+        id: String,
+        snapshot: S,
+        updates: flume::Receiver<Result<U, PaseoError>>,
+        client: &Arc<Inner>,
+    ) -> Subscription<S, U> {
+        Subscription {
+            id,
+            snapshot,
+            updates,
+            client: Arc::downgrade(client),
+        }
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn snapshot(&self) -> &S {
+        &self.snapshot
+    }
+
+    pub fn updates(&self) -> &flume::Receiver<Result<U, PaseoError>> {
+        &self.updates
+    }
+}
+
+impl<S, U> Drop for Subscription<S, U> {
+    fn drop(&mut self) {
+        if let Some(client) = self.client.upgrade() {
+            client.release(&self.id);
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalSlot {
+    terminal_id: String,
+    slot: u8,
+}
+
+impl TerminalSlot {
+    pub fn terminal_id(&self) -> &str {
+        &self.terminal_id
+    }
+}
+
+pub struct TerminalHandle {
+    subscription: Subscription<TerminalSlot, TerminalStreamEvent>,
+    writer: TerminalWriter,
+}
+
+impl TerminalHandle {
+    pub(crate) fn new(
+        subscription: Subscription<TerminalSlot, TerminalStreamEvent>,
+        client: &Arc<Inner>,
+    ) -> TerminalHandle {
+        let writer = TerminalWriter {
+            client: Arc::downgrade(client),
+            slot: subscription.snapshot().slot,
+        };
+        TerminalHandle {
+            subscription,
+            writer,
+        }
+    }
+
+    pub fn terminal_id(&self) -> &str {
+        self.subscription.snapshot().terminal_id()
+    }
+
+    pub fn events(&self) -> &flume::Receiver<Result<TerminalStreamEvent, PaseoError>> {
+        self.subscription.updates()
+    }
+
+    pub fn writer(&self) -> TerminalWriter {
+        self.writer.clone()
     }
 }
 
 #[derive(Clone)]
 pub struct TerminalWriter {
-    transport: Arc<dyn Transport>,
+    client: Weak<Inner>,
     slot: u8,
 }
 
 impl TerminalWriter {
-    pub async fn send_input(&self, data: &[u8]) -> Result<()> {
-        self.transport
-            .send_binary(encode_input(self.slot, data))
-            .await
+    pub fn send_input(&self, data: &[u8]) -> Result<(), PaseoError> {
+        self.client
+            .upgrade()
+            .ok_or(PaseoError::Closed)?
+            .send_terminal_frame(Opcode::Input, self.slot, data)
     }
 
-    pub async fn resize(&self, rows: u32, cols: u32) -> Result<()> {
-        self.transport
-            .send_binary(encode_resize(self.slot, rows, cols)?)
-            .await
+    pub fn resize(&self, size: TerminalSize, intent: ResizeIntent) -> Result<(), PaseoError> {
+        let payload = serde_json::to_vec(&ResizePayload { size, intent })?;
+        self.client
+            .upgrade()
+            .ok_or(PaseoError::Closed)?
+            .send_terminal_frame(Opcode::Resize, self.slot, &payload)
     }
-}
-
-fn try_parse_server_info(text: &str) -> Option<ServerInfo> {
-    let Incoming::Session(message) = parse_top_level(text).ok()? else {
-        return None;
-    };
-    if session_message_type(&message) != "status" {
-        return None;
-    }
-    let payload = message.get("payload")?;
-    if payload.get("status").and_then(Value::as_str) != Some("server_info") {
-        return None;
-    }
-    serde_json::from_value(payload.clone()).ok()
 }

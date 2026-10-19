@@ -1,0 +1,152 @@
+[
+  {
+    "type": "agent_stream",
+    "payload": {
+      "subscriptionId": "sub-timeline",
+      "agentId": "agent-1",
+      "timestamp": "2026-10-16T00:00:00.000Z",
+      "seq": 7,
+      "epoch": "epoch-1",
+      "event": {
+        "type": "timeline",
+        "provider": "claude",
+        "turnId": "turn-1",
+        "item": {
+          "type": "tool_call",
+          "callId": "read",
+          "name": "read",
+          "status": "completed",
+          "error": null,
+          "detail": {
+            "type": "read",
+            "filePath": "src/main.rs",
+            "offset": -1.5,
+            "limit": 2.5
+          }
+        }
+      }
+    }
+  },
+  {
+    "type": "agent_stream",
+    "payload": {
+      "subscriptionId": "sub-timeline",
+      "agentId": "agent-1",
+      "timestamp": "2026-10-16T00:00:00.000Z",
+      "seq": 7,
+      "epoch": "epoch-1",
+      "event": {
+        "type": "timeline",
+        "provider": "claude",
+        "turnId": "turn-1",
+        "item": {
+          "type": "tool_call",
+          "callId": "search",
+          "name": "search",
+          "status": "completed",
+          "error": null,
+          "detail": {
+            "type": "search",
+            "query": "fn main",
+            "numFiles": 1.5,
+            "numMatches": -2
+          }
+        }
+      }
+    }
+  },
+  {
+    "type": "agent_stream",
+    "payload": {
+      "subscriptionId": "sub-timeline",
+      "agentId": "agent-1",
+      "timestamp": "2026-10-16T00:00:00.000Z",
+      "seq": 7,
+      "epoch": "epoch-1",
+      "event": {
+        "type": "timeline",
+        "provider": "claude",
+        "turnId": "turn-1",
+        "item": {
+          "type": "tool_call",
+          "callId": "fetch",
+          "name": "fetch",
+          "status": "completed",
+          "error": null,
+          "detail": {
+            "type": "fetch",
+            "url": "https://example.com",
+            "code": 200.5,
+            "bytes": 1024.25
+          }
+        }
+      }
+    }
+  },
+  {
+    "type": "agent_stream",
+    "payload": {
+      "subscriptionId": "sub-timeline",
+      "agentId": "agent-1",
+      "timestamp": "2026-10-16T00:00:00.000Z",
+      "seq": 7,
+      "epoch": "epoch-1",
+      "event": {
+        "type": "timeline",
+        "provider": "claude",
+        "turnId": "turn-1",
+        "item": {
+          "type": "tool_call",
+          "callId": "shell",
+          "name": "shell",
+          "status": "completed",
+          "error": null,
+          "detail": {
+            "type": "shell",
+            "command": "false",
+            "exitCode": -1
+          }
+        }
+      }
+    }
+  },
+  {
+    "type": "agent_stream",
+    "payload": {
+      "agentId": "agent-1",
+      "timestamp": "2026-10-16T00:00:01.000Z",
+      "seq": 8,
+      "epoch": "epoch-1",
+      "event": {
+        "type": "timeline",
+        "provider": "claude",
+        "item": {
+          "type": "compaction",
+          "status": "completed",
+          "trigger": "auto",
+          "preTokens": 1234.5
+        }
+      }
+    }
+  },
+  {
+    "type": "agent_stream",
+    "payload": {
+      "agentId": "agent-1",
+      "timestamp": "2026-10-16T00:00:02.000Z",
+      "event": {
+        "type": "turn_completed",
+        "provider": "claude",
+        "turnId": "turn-1",
+        "usage": {
+          "inputTokens": 10.5,
+          "cachedInputTokens": 0.25,
+          "outputTokens": -3,
+          "totalCostUsd": 0.015,
+          "contextWindowMaxTokens": 200000.5,
+          "contextWindowUsedTokens": 1234.75
+        }
+      }
+    }
+  }
+]

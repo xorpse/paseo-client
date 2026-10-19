@@ -1,43 +1,57 @@
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
 
-use crate::protocol::diff::CheckoutDiff;
-use crate::protocol::{
-    AgentSnapshot, AgentStreamEvent, PermissionRequest, SubagentUpdate, TerminalInfo,
-};
+use crate::protocol::agents::{AgentAttention, PermissionRequested, PermissionResolved};
+use crate::protocol::diff::CheckoutStatus;
+use crate::protocol::providers::ProvidersSnapshot;
+use crate::protocol::subagents::SubagentUpdate;
+use crate::protocol::terminals::TerminalAttentionRequired;
+use crate::protocol::workspaces::{ProjectUpdate, ScriptStatusUpdate, WorkspaceSetupProgress};
 
-#[derive(Clone, Debug)]
-pub enum ConnectionState {
-    Connecting,
-    Handshaking,
-    Connected,
-    Disconnected(String),
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+pub enum EventKind {
+    #[serde(rename = "agent_attention_required")]
+    AgentAttention,
+    #[serde(rename = "agent_permission_request")]
+    AgentPermissionRequest,
+    #[serde(rename = "agent_permission_resolved")]
+    AgentPermissionResolved,
+    #[serde(rename = "checkout_status_update")]
+    CheckoutStatus,
+    #[serde(rename = "project.update")]
+    Project,
+    #[serde(rename = "providers_snapshot_update")]
+    ProvidersSnapshot,
+    #[serde(rename = "script_status_update")]
+    ScriptStatus,
+    #[serde(rename = "agent.provider_subagents.update")]
+    Subagent,
+    #[serde(rename = "terminal_attention_required")]
+    TerminalAttention,
+    #[serde(rename = "workspace_setup_progress")]
+    WorkspaceSetup,
 }
 
-#[derive(Clone, Debug)]
-pub enum TerminalStreamEvent {
-    Disconnected,
-    Output(Vec<u8>),
-    Restore(Vec<u8>),
-    Snapshot(Value),
-}
-
-#[derive(Clone, Debug)]
-pub enum DaemonEvent {
-    AgentUpsert(Box<AgentSnapshot>),
-    AgentRemove(String),
-    AgentStream {
-        agent_id: String,
-        event: Box<AgentStreamEvent>,
-    },
-    PermissionRequest {
-        agent_id: String,
-        request: Box<PermissionRequest>,
-    },
-    TerminalsChanged {
-        terminals: Vec<TerminalInfo>,
-    },
-    TerminalExit(String),
-    CheckoutDiff(Box<CheckoutDiff>),
-    Subagent(Box<SubagentUpdate>),
-    Disconnected,
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(tag = "type", content = "payload")]
+pub enum SessionEvent {
+    #[serde(rename = "agent_attention_required")]
+    AgentAttention(AgentAttention),
+    #[serde(rename = "agent_permission_request")]
+    AgentPermissionRequest(Box<PermissionRequested>),
+    #[serde(rename = "agent_permission_resolved")]
+    AgentPermissionResolved(PermissionResolved),
+    #[serde(rename = "checkout_status_update")]
+    CheckoutStatus(CheckoutStatus),
+    #[serde(rename = "project.update")]
+    Project(ProjectUpdate),
+    #[serde(rename = "providers_snapshot_update")]
+    ProvidersSnapshot(ProvidersSnapshot),
+    #[serde(rename = "script_status_update")]
+    ScriptStatus(ScriptStatusUpdate),
+    #[serde(rename = "agent.provider_subagents.update")]
+    Subagent(SubagentUpdate),
+    #[serde(rename = "terminal_attention_required")]
+    TerminalAttention(TerminalAttentionRequired),
+    #[serde(rename = "workspace_setup_progress")]
+    WorkspaceSetup(Box<WorkspaceSetupProgress>),
 }

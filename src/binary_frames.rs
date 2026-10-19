@@ -1,142 +1,182 @@
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
-use crate::error::{PaseoError, Result};
+use crate::protocol::terminals::TerminalSize;
 
-pub const OP_OUTPUT: u8 = 0x01;
-pub const OP_INPUT: u8 = 0x02;
-pub const OP_RESIZE: u8 = 0x03;
-pub const OP_SNAPSHOT: u8 = 0x04;
-pub const OP_RESTORE: u8 = 0x05;
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Opcode {
-    Output,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Opcode {
     Input,
+    Output,
     Resize,
-    Snapshot,
     Restore,
+    Snapshot,
 }
 
 impl Opcode {
-    pub fn from_u8(value: u8) -> Option<Opcode> {
+    fn from_byte(value: u8) -> Option<Opcode> {
         match value {
-            OP_OUTPUT => Some(Opcode::Output),
-            OP_INPUT => Some(Opcode::Input),
-            OP_RESIZE => Some(Opcode::Resize),
-            OP_SNAPSHOT => Some(Opcode::Snapshot),
-            OP_RESTORE => Some(Opcode::Restore),
+            0x01 => Some(Opcode::Output),
+            0x02 => Some(Opcode::Input),
+            0x03 => Some(Opcode::Resize),
+            0x04 => Some(Opcode::Snapshot),
+            0x05 => Some(Opcode::Restore),
             _ => None,
         }
     }
 
-    pub fn to_u8(self) -> u8 {
+    fn byte(self) -> u8 {
         match self {
-            Opcode::Output => OP_OUTPUT,
-            Opcode::Input => OP_INPUT,
-            Opcode::Resize => OP_RESIZE,
-            Opcode::Snapshot => OP_SNAPSHOT,
-            Opcode::Restore => OP_RESTORE,
+            Opcode::Output => 0x01,
+            Opcode::Input => 0x02,
+            Opcode::Resize => 0x03,
+            Opcode::Snapshot => 0x04,
+            Opcode::Restore => 0x05,
         }
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Frame {
-    pub opcode: Opcode,
-    pub slot: u8,
-    pub payload: Vec<u8>,
+pub(crate) struct TerminalFrame<'a> {
+    pub(crate) opcode: Opcode,
+    pub(crate) slot: u8,
+    pub(crate) payload: &'a [u8],
 }
 
-pub fn is_terminal_frame(bytes: &[u8]) -> bool {
-    !bytes.is_empty() && Opcode::from_u8(bytes[0]).is_some()
-}
-
-pub fn encode(opcode: Opcode, slot: u8, payload: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(2 + payload.len());
-    out.push(opcode.to_u8());
-    out.push(slot);
-    out.extend_from_slice(payload);
-    out
-}
-
-pub fn decode(bytes: &[u8]) -> Option<Frame> {
-    if bytes.len() < 2 {
-        return None;
-    }
-    let opcode = Opcode::from_u8(bytes[0])?;
-    Some(Frame {
-        opcode,
-        slot: bytes[1],
-        payload: bytes[2..].to_vec(),
-    })
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-pub struct ResizePayload {
-    pub rows: u32,
-    pub cols: u32,
-}
-
-pub fn encode_input(slot: u8, data: &[u8]) -> Vec<u8> {
-    encode(Opcode::Input, slot, data)
-}
-
-pub fn encode_resize(slot: u8, rows: u32, cols: u32) -> Result<Vec<u8>> {
-    let json = serde_json::to_vec(&ResizePayload { rows, cols })?;
-    Ok(encode(Opcode::Resize, slot, &json))
-}
-
-pub fn decode_resize(payload: &[u8]) -> Result<ResizePayload> {
-    serde_json::from_slice(payload).map_err(PaseoError::from)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn header_layout_round_trips() {
-        let frame = encode(Opcode::Output, 7, b"hello");
-        assert_eq!(frame[0], OP_OUTPUT);
-        assert_eq!(frame[1], 7);
-        assert_eq!(&frame[2..], b"hello");
-
-        let decoded = decode(&frame).expect("decode");
-        assert_eq!(decoded.opcode, Opcode::Output);
-        assert_eq!(decoded.slot, 7);
-        assert_eq!(decoded.payload, b"hello");
+impl<'a> TerminalFrame<'a> {
+    pub(crate) fn decode(bytes: &'a [u8]) -> Option<TerminalFrame<'a>> {
+        let [opcode, slot, payload @ ..] = bytes else {
+            return None;
+        };
+        Some(TerminalFrame {
+            opcode: Opcode::from_byte(*opcode)?,
+            slot: *slot,
+            payload,
+        })
     }
 
-    #[test]
-    fn short_or_unknown_frames_are_rejected() {
-        assert!(decode(&[]).is_none());
-        assert!(decode(&[0x01]).is_none());
-        assert!(decode(&[0x00, 0x00]).is_none());
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(2 + self.payload.len());
+        out.push(self.opcode.byte());
+        out.push(self.slot);
+        out.extend_from_slice(self.payload);
+        out
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResizeIntent {
+    Claim,
+    Update,
+}
+
+#[derive(Serialize)]
+pub(crate) struct ResizePayload {
+    #[serde(flatten)]
+    pub(crate) size: TerminalSize,
+    pub(crate) intent: ResizeIntent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ChannelOpcode {
+    Credit,
+    End,
+    ErrorOutput,
+    Input,
+    Output,
+    Resize,
+}
+
+impl ChannelOpcode {
+    fn from_byte(value: u8) -> Option<ChannelOpcode> {
+        match value {
+            0x20 => Some(ChannelOpcode::Input),
+            0x21 => Some(ChannelOpcode::Output),
+            0x22 => Some(ChannelOpcode::ErrorOutput),
+            0x23 => Some(ChannelOpcode::End),
+            0x24 => Some(ChannelOpcode::Credit),
+            0x25 => Some(ChannelOpcode::Resize),
+            _ => None,
+        }
     }
 
-    #[test]
-    fn slot_is_a_single_byte() {
-        let frame = encode(Opcode::Input, 255, b"");
-        assert_eq!(frame, vec![OP_INPUT, 255]);
+    fn byte(self) -> u8 {
+        match self {
+            ChannelOpcode::Input => 0x20,
+            ChannelOpcode::Output => 0x21,
+            ChannelOpcode::ErrorOutput => 0x22,
+            ChannelOpcode::End => 0x23,
+            ChannelOpcode::Credit => 0x24,
+            ChannelOpcode::Resize => 0x25,
+        }
+    }
+}
+
+pub(crate) struct ChannelFrame<'a> {
+    pub(crate) opcode: ChannelOpcode,
+    pub(crate) channel: u32,
+    pub(crate) payload: &'a [u8],
+}
+
+impl<'a> ChannelFrame<'a> {
+    const HEADER_BYTES: usize = 5;
+
+    pub(crate) fn decode(bytes: &'a [u8]) -> Option<ChannelFrame<'a>> {
+        let [opcode, a, b, c, d, payload @ ..] = bytes else {
+            return None;
+        };
+        Some(ChannelFrame {
+            opcode: ChannelOpcode::from_byte(*opcode)?,
+            channel: u32::from_be_bytes([*a, *b, *c, *d]),
+            payload,
+        })
     }
 
-    #[test]
-    fn resize_payload_is_json() {
-        let frame = encode_resize(3, 40, 120).expect("encode");
-        let decoded = decode(&frame).expect("decode");
-        assert_eq!(decoded.opcode, Opcode::Resize);
-        assert_eq!(decoded.slot, 3);
-        let payload = decode_resize(&decoded.payload).expect("resize");
-        assert_eq!(payload.rows, 40);
-        assert_eq!(payload.cols, 120);
-        assert_eq!(decoded.payload, br#"{"rows":40,"cols":120}"#.to_vec());
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(ChannelFrame::HEADER_BYTES + self.payload.len());
+        out.push(self.opcode.byte());
+        out.extend_from_slice(&self.channel.to_be_bytes());
+        out.extend_from_slice(self.payload);
+        out
     }
+}
 
-    #[test]
-    fn terminal_frame_detection_uses_leading_opcode() {
-        assert!(is_terminal_frame(&[OP_OUTPUT, 0]));
-        assert!(is_terminal_frame(&[OP_RESTORE, 1, 2, 3]));
-        assert!(!is_terminal_frame(&[0x40, 0, 0]));
-        assert!(!is_terminal_frame(&[]));
+pub(crate) enum FileTransferFrame<'a> {
+    Begin {
+        request_id: &'a str,
+        metadata: &'a [u8],
+    },
+    Chunk {
+        request_id: &'a str,
+        payload: &'a [u8],
+    },
+    End {
+        request_id: &'a str,
+    },
+}
+
+impl FileTransferFrame<'_> {
+    pub(crate) fn encode(&self) -> Option<Vec<u8>> {
+        let (opcode, request_id, metadata, payload): (u8, &str, Option<&[u8]>, &[u8]) = match self {
+            FileTransferFrame::Begin {
+                request_id,
+                metadata,
+            } => (0x10, request_id, Some(metadata), &[]),
+            FileTransferFrame::Chunk {
+                request_id,
+                payload,
+            } => (0x11, request_id, None, payload),
+            FileTransferFrame::End { request_id } => (0x12, request_id, None, &[]),
+        };
+        let request_id_length = u8::try_from(request_id.len()).ok()?;
+        let mut out =
+            Vec::with_capacity(4 + request_id.len() + metadata.map_or(payload.len(), <[u8]>::len));
+        out.push(opcode);
+        out.push(request_id_length);
+        out.extend_from_slice(request_id.as_bytes());
+        if let Some(metadata) = metadata {
+            out.extend_from_slice(&u16::try_from(metadata.len()).ok()?.to_be_bytes());
+            out.extend_from_slice(metadata);
+        }
+        out.extend_from_slice(payload);
+        Some(out)
     }
 }
