@@ -28,4 +28,4 @@ pub use error::{
 };
 pub use events::{EventKind, SessionEvent};
 pub use offer::{ConnectionOffer, RelayInfo};
-pub use rpc::AgentCreation;
+pub use rpc::{AgentCreation, WorkspaceCreation};

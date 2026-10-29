@@ -9,7 +9,7 @@ use crate::error::ArgumentError;
 use crate::protocol::diff::DiffMode;
 use crate::protocol::number::WireNumber;
 use crate::protocol::timeline::{TimelineCursor, ToolCallDetail};
-use crate::protocol::workspaces::ProjectPlacement;
+use crate::protocol::workspaces::{ProjectPlacement, WorkspaceDescriptor};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -2144,6 +2144,8 @@ pub struct CreationSnapshot {
     revision: u64,
     phase: CreationPhase,
     workspace_id: Option<String>,
+    #[serde(default)]
+    workspace: Option<Box<WorkspaceDescriptor>>,
     agent_id: Option<String>,
     #[serde(default)]
     agent: Option<Box<AgentSnapshot>>,
@@ -2177,6 +2179,10 @@ impl CreationSnapshot {
 
     pub fn workspace_id(&self) -> Option<&str> {
         self.workspace_id.as_deref()
+    }
+
+    pub fn workspace(&self) -> Option<&WorkspaceDescriptor> {
+        self.workspace.as_deref()
     }
 
     pub fn agent_id(&self) -> Option<&str> {

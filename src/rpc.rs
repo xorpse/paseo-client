@@ -18,11 +18,11 @@ use crate::envelope::{NoFields, PayloadHead, session_message};
 use crate::error::{ArgumentError, PaseoError, ProtocolViolation, RequestFailure};
 use crate::events::{EventKind, SessionEvent};
 use crate::protocol::agents::{
-    AgentActionOutcome, AgentConfigPatch, AgentCreateRequest, AgentDirectoryEntry,
+    AgentActionOutcome, AgentAttachment, AgentConfigPatch, AgentCreateRequest, AgentDirectoryEntry,
     AgentDirectoryPage, AgentDirectoryQuery, AgentFeature, AgentMessage, AgentMode,
     AgentPersistenceHandle, AgentSessionConfig, AgentSnapshot, AgentUpdate, CreationSnapshot,
-    DraftConfig, ForkedContext, ImportAgentRequest, ModelDefinition, PermissionResponse,
-    PromptPreview, ProviderNotice, RewindMode, SlashCommand, WaitOutcome,
+    DraftConfig, ForkedContext, ImageAttachment, ImportAgentRequest, ModelDefinition,
+    PermissionResponse, PromptPreview, ProviderNotice, RewindMode, SlashCommand, WaitOutcome,
 };
 use crate::protocol::channels::{NetClosed, ProcessExit, ProcessSpawn};
 use crate::protocol::daemon::{DaemonFeature, DaemonStatus, UploadedFile};
@@ -36,7 +36,7 @@ use crate::protocol::terminals::{
 use crate::protocol::timeline::{AgentTimelinePage, TimelineCursor, TimelineQuery};
 use crate::protocol::workspaces::{
     CreatedWorkspace, DirectorySuggestion, DirectorySuggestionsQuery, PaseoWorktree,
-    ProjectDescriptor, ProjectPlacement, WorkspaceCreation, WorkspaceDescriptor,
+    ProjectDescriptor, ProjectPlacement, WorkspaceCreated, WorkspaceDescriptor,
     WorkspaceDirectoryPage, WorkspaceDirectoryQuery, WorkspaceSetupSnapshot, WorkspaceSource,
     WorkspaceUpdate, WorktreeAction,
 };
@@ -182,7 +182,7 @@ struct RefreshAcknowledged {
 
 impl Response for RefreshAcknowledged {}
 
-impl Response for WorkspaceCreation {
+impl Response for WorkspaceCreated {
     fn failure(&self) -> Option<&str> {
         self.error.as_deref()
     }
@@ -351,10 +351,18 @@ struct Observed<'a, Q> {
     subscribe: NoFields,
 }
 
-pub struct AgentCreation {
+struct PendingCreation {
     registration: CreationRegistration,
     progress: flume::Receiver<Result<CreationSnapshot, PaseoError>>,
     pending: PendingReply,
+}
+
+pub struct AgentCreation {
+    creation: PendingCreation,
+}
+
+pub struct WorkspaceCreation {
+    creation: PendingCreation,
 }
 
 struct CreationRegistration {
@@ -368,22 +376,28 @@ impl Drop for CreationRegistration {
     }
 }
 
-impl AgentCreation {
-    pub fn idempotency_key(&self) -> &str {
-        &self.registration.idempotency_key
-    }
-
-    pub fn progress(&self) -> &flume::Receiver<Result<CreationSnapshot, PaseoError>> {
-        &self.progress
-    }
-
-    pub async fn finish(self) -> Result<AgentSnapshot, PaseoError> {
-        let AgentCreation {
+impl PendingCreation {
+    async fn finish(self) -> Result<Box<RawValue>, PaseoError> {
+        let PendingCreation {
             registration: _registration,
             pending,
             ..
         } = self;
-        let payload = pending.wait(None).await?;
+        pending.wait(None).await
+    }
+}
+
+impl AgentCreation {
+    pub fn idempotency_key(&self) -> &str {
+        &self.creation.registration.idempotency_key
+    }
+
+    pub fn progress(&self) -> &flume::Receiver<Result<CreationSnapshot, PaseoError>> {
+        &self.creation.progress
+    }
+
+    pub async fn finish(self) -> Result<AgentSnapshot, PaseoError> {
+        let payload = self.creation.finish().await?;
         let created = PaseoClient::parse::<AgentCreated>(AGENT_CREATE, &payload)?;
         created.agent.ok_or_else(|| {
             PaseoError::request(AGENT_CREATE.kind, RequestFailure::MissingResult("agent"))
@@ -391,7 +405,24 @@ impl AgentCreation {
     }
 }
 
+impl WorkspaceCreation {
+    pub fn idempotency_key(&self) -> &str {
+        &self.creation.registration.idempotency_key
+    }
+
+    pub fn progress(&self) -> &flume::Receiver<Result<CreationSnapshot, PaseoError>> {
+        &self.creation.progress
+    }
+
+    pub async fn finish(self) -> Result<CreatedWorkspace, PaseoError> {
+        let payload = self.creation.finish().await?;
+        let created = PaseoClient::parse::<WorkspaceCreated>(WORKSPACE_CREATE, &payload)?;
+        PaseoClient::created_workspace(WORKSPACE_CREATE, created)
+    }
+}
+
 const AGENT_CREATE: Rpc = Rpc::new("agent.create.request", "agent.create.response");
+const WORKSPACE_CREATE: Rpc = Rpc::new("workspace.create.request", "workspace.create.response");
 const PROCESS_SPAWN: Rpc = Rpc::new("process.spawn.request", "process.spawn.response");
 const NET_CONNECT: Rpc = Rpc::new("net.connect.request", "net.connect.response");
 
@@ -760,27 +791,88 @@ impl PaseoClient {
             request: &'a AgentCreateRequest,
             subscribe: bool,
         }
-        let idempotency_key = request.idempotency_key().to_owned();
-        let (progress_tx, progress) = flume::unbounded();
-        self.inner
-            .register_creation(idempotency_key.clone(), progress_tx);
-        let registration = CreationRegistration {
-            idempotency_key,
-            client: self.clone(),
-        };
         let body = Body {
             request,
             subscribe: true,
         };
+        let creation = self.submit_creation(AGENT_CREATE, request.idempotency_key(), &body)?;
+        Ok(AgentCreation { creation })
+    }
+
+    /// Creates a workspace from `source` together with its first agent, as one creation keyed by
+    /// the agent request's idempotency key. The request's workspace and worktree are ignored.
+    pub fn create_workspace_with_agent(
+        &self,
+        source: &WorkspaceSource,
+        agent: &AgentCreateRequest,
+    ) -> Result<WorkspaceCreation, PaseoError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct InitialAgent<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            agent_id: Option<&'a str>,
+            config: &'a AgentSessionConfig,
+            #[serde(skip_serializing_if = "HashMap::is_empty")]
+            env: &'a HashMap<String, String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            initial_prompt: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            client_message_id: Option<&'a str>,
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            images: &'a [ImageAttachment],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            attachments: &'a [AgentAttachment],
+            labels: &'a HashMap<String, String>,
+        }
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            source: &'a WorkspaceSource,
+            idempotency_key: &'a str,
+            agent: InitialAgent<'a>,
+            subscribe: bool,
+        }
+        let body = Body {
+            source,
+            idempotency_key: agent.idempotency_key(),
+            agent: InitialAgent {
+                agent_id: agent.agent_id(),
+                config: agent.config(),
+                env: agent.env(),
+                initial_prompt: agent.initial_prompt(),
+                client_message_id: agent.client_message_id(),
+                images: agent.images(),
+                attachments: agent.attachments(),
+                labels: agent.labels(),
+            },
+            subscribe: true,
+        };
+        let creation = self.submit_creation(WORKSPACE_CREATE, agent.idempotency_key(), &body)?;
+        Ok(WorkspaceCreation { creation })
+    }
+
+    fn submit_creation<B: Serialize>(
+        &self,
+        rpc: Rpc,
+        idempotency_key: &str,
+        body: &B,
+    ) -> Result<PendingCreation, PaseoError> {
+        let (progress_tx, progress) = flume::unbounded();
+        self.inner
+            .register_creation(idempotency_key.to_owned(), progress_tx);
+        let registration = CreationRegistration {
+            idempotency_key: idempotency_key.to_owned(),
+            client: self.clone(),
+        };
         let pending = self.inner.submit(
             &Request {
-                kind: AGENT_CREATE.kind,
-                response_type: AGENT_CREATE.response,
-                body: &body,
+                kind: rpc.kind,
+                response_type: rpc.response,
+                body,
             },
             None,
         )?;
-        Ok(AgentCreation {
+        Ok(PendingCreation {
             registration,
             progress,
             pending,
@@ -1477,11 +1569,10 @@ impl PaseoClient {
             #[serde(skip_serializing_if = "Option::is_none")]
             title: Option<&'a str>,
         }
-        let rpc = Rpc::new("workspace.create.request", "workspace.create.response");
         let creation = self
-            .call::<_, WorkspaceCreation>(rpc, &Body { source, title })
+            .call::<_, WorkspaceCreated>(WORKSPACE_CREATE, &Body { source, title })
             .await?;
-        Self::created_workspace(rpc, creation)
+        Self::created_workspace(WORKSPACE_CREATE, creation)
     }
 
     pub async fn list_paseo_worktrees(&self, cwd: &str) -> Result<Vec<PaseoWorktree>, PaseoError> {
@@ -1540,19 +1631,20 @@ impl PaseoClient {
             worktree_slug,
             first_agent_context: first_prompt.map(|prompt| FirstAgentContext { prompt }),
         };
-        let creation = self.call::<_, WorkspaceCreation>(rpc, &body).await?;
+        let creation = self.call::<_, WorkspaceCreated>(rpc, &body).await?;
         Self::created_workspace(rpc, creation)
     }
 
     fn created_workspace(
         rpc: Rpc,
-        creation: WorkspaceCreation,
+        creation: WorkspaceCreated,
     ) -> Result<CreatedWorkspace, PaseoError> {
         let workspace = creation.workspace.ok_or_else(|| {
             PaseoError::request(rpc.kind, RequestFailure::MissingResult("workspace"))
         })?;
         Ok(CreatedWorkspace::new(
             workspace,
+            creation.agent,
             creation.setup_terminal_id,
             creation.setup_skipped_reason,
         ))

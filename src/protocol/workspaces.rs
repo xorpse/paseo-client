@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::ArgumentError;
 use crate::protocol::number::WireNumber;
 
-use crate::protocol::agents::{Page, PageInfo, Sort, SortDirection};
+use crate::protocol::agents::{AgentSnapshot, Page, PageInfo, Sort, SortDirection};
 use crate::protocol::timeline::WorktreeSetupDetail;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -887,6 +887,7 @@ impl WorktreeSource {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreatedWorkspace {
     workspace: WorkspaceDescriptor,
+    agent: Option<AgentSnapshot>,
     setup_terminal_id: Option<String>,
     setup_skipped_reason: Option<String>,
 }
@@ -894,11 +895,13 @@ pub struct CreatedWorkspace {
 impl CreatedWorkspace {
     pub(crate) fn new(
         workspace: WorkspaceDescriptor,
+        agent: Option<AgentSnapshot>,
         setup_terminal_id: Option<String>,
         setup_skipped_reason: Option<String>,
     ) -> CreatedWorkspace {
         CreatedWorkspace {
             workspace,
+            agent,
             setup_terminal_id,
             setup_skipped_reason,
         }
@@ -906,6 +909,10 @@ impl CreatedWorkspace {
 
     pub fn workspace(&self) -> &WorkspaceDescriptor {
         &self.workspace
+    }
+
+    pub fn agent(&self) -> Option<&AgentSnapshot> {
+        self.agent.as_ref()
     }
 
     pub fn setup_terminal_id(&self) -> Option<&str> {
@@ -919,8 +926,10 @@ impl CreatedWorkspace {
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct WorkspaceCreation {
+pub(crate) struct WorkspaceCreated {
     pub(crate) workspace: Option<WorkspaceDescriptor>,
+    #[serde(default)]
+    pub(crate) agent: Option<AgentSnapshot>,
     pub(crate) error: Option<String>,
     #[serde(default)]
     pub(crate) setup_terminal_id: Option<String>,

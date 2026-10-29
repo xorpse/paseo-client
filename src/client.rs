@@ -435,7 +435,7 @@ impl Inner {
             }
             return;
         }
-        if head.kind != "agent.create.update" {
+        if head.kind != "agent.create.update" && head.kind != "workspace.create.update" {
             return;
         }
         let Some(payload) = head.payload else {
