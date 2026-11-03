@@ -2,7 +2,6 @@ use std::borrow::Cow;
 use std::collections::{HashMap, hash_map::Entry};
 use std::future::Future;
 use std::pin::pin;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -148,7 +147,6 @@ pub(crate) struct Inner {
     server_info: ServerInfo,
     outgoing: flume::Sender<Outgoing>,
     pongs: flume::Sender<()>,
-    liveness_failures: AtomicU32,
     state: Mutex<State>,
     driver: Mutex<Option<Driver>>,
 }
@@ -210,7 +208,6 @@ impl PaseoClient {
                 server_info,
                 outgoing,
                 pongs,
-                liveness_failures: AtomicU32::new(0),
                 state: Mutex::new(State {
                     connected: true,
                     ..State::default()
@@ -286,7 +283,6 @@ impl PaseoClient {
                 if let Message::Close(_) = message {
                     return Ok(());
                 }
-                self.inner.liveness_failures.store(0, Ordering::Relaxed);
                 if let Some(frame) = wire.decode(message)? {
                     self.inner.dispatch(frame);
                 }
@@ -306,14 +302,16 @@ impl PaseoClient {
             Ok(())
         };
         let liveness = async {
+            let mut failures = 0;
             loop {
                 Timer::after(LIVENESS_INTERVAL).await;
                 pongs.drain();
                 self.inner.send(Frame::Text(PING.to_owned()))?;
                 if timed(pongs.recv_async(), LIVENESS_TIMEOUT).await.is_some() {
+                    failures = 0;
                     continue;
                 }
-                let failures = self.inner.liveness_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                failures += 1;
                 if failures >= LIVENESS_FAILURE_THRESHOLD {
                     return Err(PaseoError::LivenessTimeout);
                 }
