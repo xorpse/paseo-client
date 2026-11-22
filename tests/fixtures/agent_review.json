@@ -1,0 +1,107 @@
+{
+  "agentId": "agent-1",
+  "repositories": [
+    {
+      "root": "/repo",
+      "baseRef": "refs/remotes/origin/main",
+      "belongsTo": null,
+      "files": [
+        {
+          "path": "/repo/src/main.ts",
+          "toolCalls": [{ "callId": "call-1", "subagentId": null, "turnIndex": 0 }]
+        },
+        { "path": "/repo/side.txt", "toolCalls": [] }
+      ]
+    },
+    {
+      "root": "/repo/vendor/lib",
+      "baseRef": null,
+      "belongsTo": "/repo",
+      "files": [
+        {
+          "path": "/repo/vendor/lib/a.rs",
+          "toolCalls": [{ "callId": "call-2", "subagentId": "child-1", "turnIndex": null }]
+        }
+      ]
+    }
+  ],
+  "turns": [
+    {
+      "index": 0,
+      "origin": "prompt",
+      "messageId": "message-1",
+      "turnId": "turn-1",
+      "startedAt": "2026-11-13T10:00:00.000Z",
+      "heads": [{ "repoRoot": "/repo", "commit": "4b825dc642cb6eb9a060e54bf8d69288fbee4904" }]
+    },
+    {
+      "index": 1,
+      "origin": "autonomous",
+      "messageId": null,
+      "turnId": null,
+      "startedAt": "2026-11-13T10:05:00.000Z",
+      "heads": []
+    }
+  ],
+  "seen": [{ "repoRoot": "/repo", "path": "/repo/src/main.ts", "fingerprint": null }],
+  "comments": [
+    {
+      "id": "comment-1",
+      "parentId": null,
+      "repoRoot": "/repo",
+      "path": "/repo/src/main.ts",
+      "startLine": 3,
+      "endLine": 4,
+      "context": { "before": "fn main() {", "target": "  run();", "after": "}" },
+      "fingerprint": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+      "body": "Handle the error here.",
+      "state": { "type": "sent", "messageId": "message-1" },
+      "createdAt": "2026-11-13T10:01:00.000Z",
+      "updatedAt": "2026-11-13T10:02:00.000Z"
+    },
+    {
+      "id": "comment-2",
+      "parentId": "comment-1",
+      "repoRoot": "/repo",
+      "path": "/repo/src/main.ts",
+      "startLine": 3,
+      "endLine": 3,
+      "context": { "before": "", "target": "  run();", "after": "" },
+      "fingerprint": null,
+      "body": "Done.",
+      "state": { "type": "resolved", "messageId": null },
+      "createdAt": "2026-11-13T10:03:00.000Z",
+      "updatedAt": "2026-11-13T10:03:00.000Z"
+    },
+    {
+      "id": "comment-3",
+      "parentId": null,
+      "repoRoot": "/repo",
+      "path": "/repo/src/main.ts",
+      "startLine": 7,
+      "endLine": 8,
+      "side": "old",
+      "context": { "before": "}", "target": "fn legacy() {\n}", "after": "" },
+      "fingerprint": null,
+      "body": "Why remove this?",
+      "state": { "type": "draft" },
+      "createdAt": "2026-11-13T10:04:00.000Z",
+      "updatedAt": "2026-11-13T10:04:00.000Z"
+    },
+    {
+      "id": "comment-4",
+      "parentId": null,
+      "repoRoot": "/repo",
+      "path": "/repo/src/main.ts",
+      "startLine": 1,
+      "endLine": 1,
+      "side": "both",
+      "context": { "before": "", "target": "x", "after": "" },
+      "fingerprint": null,
+      "body": "From a newer daemon.",
+      "state": { "type": "draft" },
+      "createdAt": "2026-11-13T10:05:00.000Z",
+      "updatedAt": "2026-11-13T10:05:00.000Z"
+    }
+  ]
+}

@@ -9,6 +9,8 @@ pub enum SubagentStatus {
     Completed,
     Failed,
     Running,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -95,6 +97,8 @@ pub enum SubagentUpdate {
     Remove(SubagentRemoval),
     Timeline(SubagentTimelineUpdate),
     Upsert(SubagentUpsert),
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]

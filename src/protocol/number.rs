@@ -1,6 +1,6 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(transparent)]
 pub(crate) struct WireNumber(f64);
 

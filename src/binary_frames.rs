@@ -1,3 +1,5 @@
+use std::str;
+
 use serde::Serialize;
 
 use crate::protocol::terminals::TerminalSize;
@@ -154,17 +156,23 @@ pub(crate) enum FileTransferFrame<'a> {
 }
 
 impl FileTransferFrame<'_> {
+    const BEGIN: u8 = 0x10;
+    const CHUNK: u8 = 0x11;
+    const END: u8 = 0x12;
+
     pub(crate) fn encode(&self) -> Option<Vec<u8>> {
         let (opcode, request_id, metadata, payload): (u8, &str, Option<&[u8]>, &[u8]) = match self {
             FileTransferFrame::Begin {
                 request_id,
                 metadata,
-            } => (0x10, request_id, Some(metadata), &[]),
+            } => (FileTransferFrame::BEGIN, request_id, Some(metadata), &[]),
             FileTransferFrame::Chunk {
                 request_id,
                 payload,
-            } => (0x11, request_id, None, payload),
-            FileTransferFrame::End { request_id } => (0x12, request_id, None, &[]),
+            } => (FileTransferFrame::CHUNK, request_id, None, payload),
+            FileTransferFrame::End { request_id } => {
+                (FileTransferFrame::END, request_id, None, &[])
+            }
         };
         let request_id_length = u8::try_from(request_id.len()).ok()?;
         let mut out =
@@ -178,5 +186,88 @@ impl FileTransferFrame<'_> {
         }
         out.extend_from_slice(payload);
         Some(out)
+    }
+}
+
+impl<'a> FileTransferFrame<'a> {
+    pub(crate) fn decode(bytes: &'a [u8]) -> Option<FileTransferFrame<'a>> {
+        let [
+            opcode @ (FileTransferFrame::BEGIN | FileTransferFrame::CHUNK | FileTransferFrame::END),
+            request_id_length,
+            rest @ ..,
+        ] = bytes
+        else {
+            return None;
+        };
+        let length = usize::from(*request_id_length);
+        if length == 0 || rest.len() < length {
+            return None;
+        }
+        let (request_id, body) = rest.split_at(length);
+        let request_id = str::from_utf8(request_id).ok()?;
+        match *opcode {
+            FileTransferFrame::BEGIN => {
+                let [high, low, metadata @ ..] = body else {
+                    return None;
+                };
+                (usize::from(u16::from_be_bytes([*high, *low])) == metadata.len()).then_some(
+                    FileTransferFrame::Begin {
+                        request_id,
+                        metadata,
+                    },
+                )
+            }
+            FileTransferFrame::CHUNK => Some(FileTransferFrame::Chunk {
+                request_id,
+                payload: body,
+            }),
+            _ => body
+                .is_empty()
+                .then_some(FileTransferFrame::End { request_id }),
+        }
+    }
+
+    pub(crate) fn request_id(&self) -> &'a str {
+        match self {
+            FileTransferFrame::Begin { request_id, .. }
+            | FileTransferFrame::Chunk { request_id, .. }
+            | FileTransferFrame::End { request_id } => request_id,
+        }
+    }
+}
+
+pub(crate) struct HostRouteFrame<'a> {
+    pub(crate) route_id: &'a str,
+    pub(crate) payload: &'a [u8],
+}
+
+impl<'a> HostRouteFrame<'a> {
+    const OPCODE: u8 = 0x30;
+    pub(crate) const MAX_ROUTE_ID_BYTES: usize = 256;
+
+    pub(crate) fn decode(bytes: &'a [u8]) -> Option<HostRouteFrame<'a>> {
+        let [HostRouteFrame::OPCODE, high, low, rest @ ..] = bytes else {
+            return None;
+        };
+        let length = usize::from(u16::from_be_bytes([*high, *low]));
+        if length == 0 || length > HostRouteFrame::MAX_ROUTE_ID_BYTES || rest.len() < length {
+            return None;
+        }
+        let (route_id, payload) = rest.split_at(length);
+        Some(HostRouteFrame {
+            route_id: str::from_utf8(route_id).ok()?,
+            payload,
+        })
+    }
+
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        let length = u16::try_from(self.route_id.len())
+            .expect("route ids are checked against their length limit when the route opens");
+        let mut out = Vec::with_capacity(3 + self.route_id.len() + self.payload.len());
+        out.push(HostRouteFrame::OPCODE);
+        out.extend_from_slice(&length.to_be_bytes());
+        out.extend_from_slice(self.route_id.as_bytes());
+        out.extend_from_slice(self.payload);
+        out
     }
 }

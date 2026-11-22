@@ -1,18 +1,23 @@
 use std::collections::HashMap;
 use std::num::NonZeroU64;
+use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+use futures::channel::oneshot;
+use futures::future::{self, Either};
 use serde::de::{DeserializeOwned, Error as _};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use serde_json::value::RawValue;
+use serde_json::{Map, Value};
 
 use crate::binary_frames::FileTransferFrame;
 use crate::channel::{Channel, ChannelLease, NetChannel, ProcessChannel, Termination};
 use crate::client::{
-    Inner, PaseoClient, Payload, PendingReply, REQUEST_TIMEOUT, Request, Routed, Subscription,
-    TerminalHandle, TerminalSlot,
+    CONNECT_TIMEOUT, ConnectOptions, Download, Inner, PaseoClient, Payload, PendingReply,
+    REQUEST_TIMEOUT, Request, Routed, Subscription, TerminalHandle, TerminalSlot, Tracking, timed,
 };
 use crate::envelope::{NoFields, PayloadHead, session_message};
 use crate::error::{ArgumentError, PaseoError, ProtocolViolation, RequestFailure};
@@ -20,33 +25,81 @@ use crate::events::{EventKind, SessionEvent};
 use crate::protocol::agents::{
     AgentActionOutcome, AgentAttachment, AgentConfigPatch, AgentCreateRequest, AgentDirectoryEntry,
     AgentDirectoryPage, AgentDirectoryQuery, AgentFeature, AgentMessage, AgentMode,
-    AgentPersistenceHandle, AgentSessionConfig, AgentSnapshot, AgentUpdate, CreationSnapshot,
-    DraftConfig, ForkedContext, ImageAttachment, ImportAgentRequest, ModelDefinition,
-    PermissionResponse, PromptPreview, ProviderNotice, RewindMode, SlashCommand, WaitOutcome,
+    AgentPersistenceHandle, AgentSessionConfig, AgentSnapshot, AgentUpdate, CreationKind,
+    CreationSnapshot, DraftConfig, ForkedContext, ImageAttachment, ImportAgentRequest,
+    ModelDefinition, PermissionResponse, PromptPreview, ProviderNotice, RewindMode, SlashCommand,
+    WaitOutcome,
 };
 use crate::protocol::channels::{NetClosed, ProcessExit, ProcessSpawn};
-use crate::protocol::daemon::{DaemonFeature, DaemonStatus, UploadedFile};
-use crate::protocol::diff::{CheckoutDiff, CheckoutError, CheckoutStatus, DiffCompare};
-use crate::protocol::providers::{ProviderAvailability, ProvidersSnapshot};
+use crate::protocol::checkout::{
+    BranchSource, BranchValidation, CheckDetails, CheckDetailsQuery, CommitFile, CommitList,
+    CommitPage, CreatedPullRequest, ForgeAuthState, ForgeItem, ForgeItemKind, ForgeSearchResults,
+    ForgeStatus, MergeMethod, MergeStrategy, PullRequestTimeline, RepositorySearch, StashEntry,
+};
+use crate::protocol::config::{
+    ConfigReload, DaemonConfig, DaemonConfigPatch, ProjectConfig, ProjectConfigError,
+    ProjectConfigRevision,
+};
+use crate::protocol::daemon::{
+    ClientHeartbeat, DaemonFeature, DaemonStatus, DaemonUpdatePhase, DaemonUpdated, PairingOffer,
+    UploadedFile,
+};
+use crate::protocol::diff::{
+    CheckoutDiff, CheckoutError, CheckoutStatus, DiffCompare, DiffFile, DiffMode,
+};
+use crate::protocol::files::{
+    ContentEncoding, DirectoryListing, DownloadToken, ExplorerFile, FileContent, FileEntry,
+    FileRevision, FileState, FileVersion, FileWrite, FileWriteOutcome,
+};
+use crate::protocol::hosts::{HostAdd, HostDirectory, HostSummary, HostUpdate};
+use crate::protocol::labels::{
+    EditedLabel, LabelAssignment, LabelCatalogue, LabelCursor, LabelEdit, LabelUpdate,
+    WorkspaceLabel,
+};
+use crate::protocol::providers::{
+    ProviderAvailability, ProviderInstallations, ProviderSetup, ProviderSetupAction,
+    ProvidersSnapshot, RecentProviderSessions, RecentSessionsQuery,
+};
+use crate::protocol::recognised::recognised_entries;
+use crate::protocol::review::{
+    AgentReview, CommentSide, FileReference, ReviewCommentInput, SeenFile,
+};
+use crate::protocol::schedules::{
+    Schedule, ScheduleCreate, ScheduleDetail, ScheduleRun, ScheduleUpdate,
+};
+use crate::protocol::skills::{ImportedSkills, SavedSkills, SkillSelection, SkillsStatus};
 use crate::protocol::stream::TimelineUpdate;
 use crate::protocol::subagents::{ProviderSubagent, SubagentTimelinePage, SubagentTimelineQuery};
 use crate::protocol::terminals::{
     CreateTerminalOptions, TerminalInfo, TerminalRestore, TerminalStreamEvent, TerminalsChanged,
 };
-use crate::protocol::timeline::{AgentTimelinePage, TimelineCursor, TimelineQuery};
+use crate::protocol::timeline::{AgentTimelinePage, TimelineCursor, TimelineQuery, TimelineSearch};
+use crate::protocol::usage::{ProviderUsageList, UsageReportEntry, UsageReportsQuery};
 use crate::protocol::workspaces::{
-    CreatedWorkspace, DirectorySuggestion, DirectorySuggestionsQuery, PaseoWorktree,
-    ProjectDescriptor, ProjectPlacement, WorkspaceCreated, WorkspaceDescriptor,
-    WorkspaceDirectoryPage, WorkspaceDirectoryQuery, WorkspaceSetupSnapshot, WorkspaceSource,
-    WorkspaceUpdate, WorktreeAction,
+    AttentionCleared, ClosedItems, CreatedWorkspace, DirectorySuggestion,
+    DirectorySuggestionsQuery, EntryKind, PaseoWorktree, ProjectDescriptor, ProjectIcon,
+    ProjectPlacement, WorkspaceCreated, WorkspaceDescriptor, WorkspaceDirectoryPage,
+    WorkspaceDirectoryQuery, WorkspaceRecovery, WorkspaceScript, WorkspaceSetupProgress,
+    WorkspaceSetupSnapshot, WorkspaceSource, WorkspaceUpdate, WorktreeAction,
 };
-use crate::transport::Frame;
+use crate::transport::{Connection, Frame, RoutedSocket, Socket};
 
 const GITHUB_CLONE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const PROVIDER_CATALOGUE_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_WAIT_FOR_FINISH_MS: u64 = 2_147_483_647;
 const UPLOAD_CHUNK_BYTES: usize = 128 * 1024;
-const UPLOAD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const FILE_TRANSFER_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const FORGE_SEARCH_MAX_LIMIT: u32 = 50;
+const CHECKOUT_MUTATION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const DAEMON_UPDATE_PROGRESS: &str = "daemon.update.progress";
+const USAGE_REPORT_UPDATE: &str = "usage.list_reports.update";
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum NetTarget<'a> {
+    Tcp { host: &'a str, port: u16 },
+    Unix { path: &'a str },
+}
 
 #[derive(Clone, Copy)]
 struct Rpc {
@@ -58,21 +111,36 @@ impl Rpc {
     const fn new(kind: &'static str, response: &'static str) -> Rpc {
         Rpc { kind, response }
     }
+
+    fn required<T>(self, value: Option<T>, result: &'static str) -> Result<T, PaseoError> {
+        value.ok_or_else(|| PaseoError::request(self.kind, RequestFailure::MissingResult(result)))
+    }
+
+    fn accepted(self, accepted: bool) -> Result<(), PaseoError> {
+        if accepted {
+            return Ok(());
+        }
+        Err(PaseoError::request(self.kind, RequestFailure::Declined))
+    }
 }
 
 trait Response: DeserializeOwned {
     fn failure(&self) -> Option<&str> {
         None
     }
+
+    fn rejection(&self) -> Option<&CheckoutError> {
+        None
+    }
 }
 
 macro_rules! response {
-    ($($name:ident { $($field:ident: $ty:ty),* $(,)? })*) => {
+    ($($name:ident { $($(#[$attribute:meta])* $field:ident: $ty:ty),* $(,)? })*) => {
         $(
             #[derive(Deserialize)]
             #[serde(rename_all = "camelCase")]
             struct $name {
-                $(#[serde(default)] $field: $ty,)*
+                $(#[serde(default)] $(#[$attribute])* $field: $ty,)*
                 #[serde(default)]
                 error: Option<String>,
             }
@@ -87,31 +155,60 @@ macro_rules! response {
 }
 
 response! {
+    Accepted { accepted: bool }
     ActionResponse { agent_id: String, accepted: bool, notice: Option<ProviderNotice> }
+    AgentArchived { archived_at: String }
     AgentCreated { agent: Option<AgentSnapshot> }
     AgentFetched { agent: Option<AgentSnapshot>, project: Option<ProjectPlacement> }
-    AgentArchived { archived_at: String }
+    AttentionClearedAll { success: bool, results: Vec<AttentionCleared> }
     BranchSuggestions { branches: Vec<String> }
     CancelResponse {}
     CommandsListed { commands: Vec<SlashCommand> }
-    DirectorySuggestions { entries: Vec<DirectorySuggestion> }
+    ConfigFetched { config: Option<DaemonConfig> }
+    CreationSubscribed { snapshot: Option<CreationSnapshot> }
+    Diagnosed { diagnostic: Option<String> }
     DirectoryCreated { directory_path: Option<String> }
+    DirectorySuggestions { entries: Vec<DirectorySuggestion> }
     EntryCreated { path: Option<String>, success: bool }
-    FeaturesListed { features: Vec<AgentFeature> }
+    EntryDeleted { success: bool }
+    EntryDuplicated { duplicated_path: Option<String>, success: bool }
+    EntryRenamed { renamed_path: Option<String>, success: bool }
+    Explored { directory: Option<DirectoryListing>, file: Option<ExplorerFile> }
+    FileUploaded { file: Option<UploadedFile> }
+    ForgeSearched {
+        #[serde(deserialize_with = "recognised_entries")]
+        items: Vec<ForgeItem>,
+        auth_state: Option<ForgeAuthState>,
+        features_enabled: Option<bool>,
+        github_features_enabled: Option<bool>,
+    }
     GithubCloned { checkout_path: Option<String>, project: Option<ProjectDescriptor> }
+    HostSaved { host: Option<HostSummary> }
+    LabelCount { affected_workspace_count: u64 }
+    MarkedUnread { success: bool, marked_agent_id: Option<String> }
     ModelsListed { models: Vec<ModelDefinition> }
     ModesListed { modes: Vec<AgentMode> }
+    Pinned { accepted: bool, pinned_at: Option<String> }
     ProjectAdded { project: Option<ProjectDescriptor> }
+    ProjectIconFetched { icon: Option<WireProjectIcon> }
     ProjectOpened { workspace: Option<WorkspaceDescriptor> }
+    ProjectRemoved { accepted: bool, removed_workspace_ids: Vec<String> }
+    ProjectRenamed { accepted: bool, custom_name: Option<String> }
     PromptsListed { prompts: Vec<PromptPreview> }
     ProvidersListed { providers: Vec<ProviderAvailability> }
+    RecoveryInspected { state: Option<WorkspaceRecovery> }
     RewindResponse { ok: bool }
+    ScheduleFetched { schedule: Option<Schedule> }
+    ScheduleInspected { schedule: Option<ScheduleDetail> }
+    ScheduleRunsListed { runs: Vec<ScheduleRun> }
+    SchedulesListed { schedules: Vec<Schedule> }
+    ScriptsListed { scripts: Vec<WorkspaceScript> }
     SendResponse { accepted: bool }
+    SetupStarted { started: bool }
     SetupStatus { snapshot: Option<WorkspaceSetupSnapshot> }
     SubagentsListed { subagents: Vec<ProviderSubagent> }
     TerminalCreated { terminal: Option<TerminalInfo> }
     TerminalRenamed { success: bool }
-    FileUploaded { file: Option<UploadedFile> }
     TitleSet { accepted: bool }
     WorkspaceArchived { archived_at: Option<String> }
 }
@@ -119,6 +216,8 @@ response! {
 impl Response for AgentDirectoryPage {}
 impl Response for WorkspaceDirectoryPage {}
 impl Response for ProvidersSnapshot {}
+impl Response for ProviderInstallations {}
+impl Response for ProviderSetup {}
 impl Response for TerminalsChanged {}
 impl Response for TerminalSlot {}
 impl Response for DaemonStatus {}
@@ -139,6 +238,34 @@ impl Response for StatusPayload {
     }
 }
 
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum ServerStatus {
+    RestartRequested,
+    ShutdownRequested,
+    #[serde(other)]
+    Unrecognised,
+}
+
+#[derive(Deserialize)]
+struct ServerStatusReply {
+    status: ServerStatus,
+}
+
+impl Response for ServerStatusReply {}
+
+impl ServerStatusReply {
+    fn confirm(&self, rpc: Rpc, expected: ServerStatus) -> Result<(), PaseoError> {
+        if self.status == expected {
+            return Ok(());
+        }
+        Err(PaseoError::request(
+            rpc.kind,
+            RequestFailure::UnrecognisedOutcome,
+        ))
+    }
+}
+
 #[derive(Deserialize)]
 struct Failure {
     #[serde(default)]
@@ -151,9 +278,36 @@ impl Response for Failure {
     }
 }
 
-impl Response for Box<RawValue> {}
+#[derive(Deserialize)]
+struct CheckoutDone {
+    #[serde(default)]
+    success: bool,
+}
+
+#[derive(Deserialize)]
+struct PullRequestCreated {
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    number: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct ReviewSubscribed {
+    review: AgentReview,
+}
+
+#[derive(Deserialize)]
+struct ReviewUpdate {
+    review: AgentReview,
+}
+
 impl Response for CheckoutDiff {}
 impl Response for CheckoutStatus {}
+impl Response for ForgeStatus {}
+impl Response for PullRequestTimeline {}
+impl Response for RecentProviderSessions {}
+impl Response for RepositorySearch {}
 impl Response for WaitOutcome {}
 
 #[derive(Deserialize)]
@@ -189,70 +343,215 @@ impl Response for WorkspaceCreated {
 }
 
 #[derive(Deserialize)]
+struct FeaturesListed {
+    #[serde(default, deserialize_with = "recognised_entries")]
+    features: Vec<AgentFeature>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+impl Response for FeaturesListed {
+    fn failure(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct WireProjectIcon {
+    data: String,
+    mime_type: String,
+}
+
+#[derive(Deserialize)]
 struct FileWritten {
-    result: FileWriteResult,
+    result: FileWriteOutcome,
 }
 
 impl Response for FileWritten {}
 
 #[derive(Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-enum FileWriteResult {
-    Conflict { version: FileVersion },
-    Error { error: String },
-    Written {},
+struct FileSubscribed {
+    initial: FileVersion,
 }
 
 #[derive(Deserialize)]
-#[serde(
-    tag = "status",
-    rename_all = "snake_case",
-    rename_all_fields = "camelCase"
-)]
-enum FileVersion {
-    Error {
-        error: String,
-    },
-    Missing {},
-    Ready {
-        modified_at: String,
-        #[serde(default)]
-        revision: Option<String>,
-    },
+struct HostsListed {
+    directory: HostDirectory,
 }
 
-#[derive(Default, Serialize)]
+impl Response for HostsListed {}
+
+#[derive(Deserialize)]
+struct Checked<T> {
+    #[serde(flatten)]
+    value: T,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+impl<T: DeserializeOwned> Response for Checked<T> {
+    fn failure(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+}
+
+#[derive(Deserialize)]
+struct CheckoutResult<T> {
+    #[serde(flatten)]
+    value: T,
+    #[serde(default)]
+    error: Option<CheckoutError>,
+}
+
+impl<T: DeserializeOwned> Response for CheckoutResult<T> {
+    fn rejection(&self) -> Option<&CheckoutError> {
+        self.error.as_ref()
+    }
+}
+
+#[derive(Deserialize)]
+struct CheckDetailsFetched {
+    #[serde(default)]
+    details: Option<CheckDetails>,
+}
+
+#[derive(Deserialize)]
+struct CommitFound {
+    #[serde(default)]
+    commit: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FileAtRevisionFetched {
+    #[serde(default)]
+    content: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FileDiffFetched {
+    #[serde(default)]
+    file: Option<DiffFile>,
+}
+
+#[derive(Deserialize)]
+struct BranchSwitched {
+    #[serde(default)]
+    success: bool,
+    #[serde(default)]
+    source: Option<BranchSource>,
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ExpectedVersion {
-    expected_modified_at: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    expected_revision: Option<String>,
+struct BranchRenamed {
+    #[serde(default)]
+    success: bool,
+    #[serde(default)]
+    current_branch: Option<String>,
 }
 
 #[derive(Deserialize)]
-struct DirectoryListed {
-    directory: Option<ListedDirectory>,
-}
-
-impl Response for DirectoryListed {}
-
-#[derive(Deserialize)]
-struct ListedDirectory {
-    entries: Vec<ListedEntry>,
+struct StashesListed {
+    #[serde(default)]
+    entries: Vec<StashEntry>,
 }
 
 #[derive(Deserialize)]
-struct ListedEntry {
-    name: String,
-    kind: EntryKind,
+struct ProjectConfigReply {
+    #[serde(flatten)]
+    config: ProjectConfig,
+    #[serde(default)]
+    error: Option<ProjectConfigError>,
 }
 
-#[derive(Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum EntryKind {
-    Directory,
-    File,
+impl Response for ProjectConfigReply {}
+
+#[derive(Deserialize)]
+struct DaemonUpdateFinished {
+    #[serde(default)]
+    success: bool,
+    #[serde(flatten)]
+    versions: DaemonUpdated,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+impl Response for DaemonUpdateFinished {
+    fn failure(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+}
+
+#[derive(Deserialize)]
+struct FileUpdated {
+    version: FileVersion,
+}
+
+#[derive(Deserialize)]
+struct HostsChanged {
+    directory: HostDirectory,
+}
+
+#[derive(Deserialize)]
+struct UsageReported {
+    report: UsageReportEntry,
+}
+
+#[derive(Deserialize)]
+struct UpdateProgressed {
+    phase: DaemonUpdatePhase,
+}
+
+impl Routed for FileVersion {
+    fn decode(kind: &str, message: &RawValue) -> Result<FileVersion, PaseoError> {
+        decode_payload::<FileUpdated>("fs.file.update", kind, message).map(|update| update.version)
+    }
+}
+
+impl Routed for LabelUpdate {
+    fn decode(kind: &str, message: &RawValue) -> Result<LabelUpdate, PaseoError> {
+        decode_payload("workspace.label.update", kind, message)
+    }
+}
+
+impl Routed for WorkspaceSetupProgress {
+    fn decode(kind: &str, message: &RawValue) -> Result<WorkspaceSetupProgress, PaseoError> {
+        decode_payload("workspace_setup_progress", kind, message)
+    }
+}
+
+impl Routed for CreationSnapshot {
+    fn decode(kind: &str, message: &RawValue) -> Result<CreationSnapshot, PaseoError> {
+        let snapshot = serde_json::from_str::<Payload<CreationSnapshot>>(message.get())
+            .map_err(|error| PaseoError::decode(kind, error))?
+            .payload;
+        if snapshot.kind().update_type() != Some(kind) {
+            return Err(foreign_message(kind));
+        }
+        Ok(snapshot)
+    }
+}
+
+impl Routed for HostDirectory {
+    fn decode(kind: &str, message: &RawValue) -> Result<HostDirectory, PaseoError> {
+        decode_payload::<HostsChanged>("hosts.changed", kind, message)
+            .map(|changed| changed.directory)
+    }
+}
+
+impl Routed for UsageReportEntry {
+    fn decode(kind: &str, message: &RawValue) -> Result<UsageReportEntry, PaseoError> {
+        decode_payload::<UsageReported>(USAGE_REPORT_UPDATE, kind, message)
+            .map(|reported| reported.report)
+    }
+}
+
+impl Routed for DaemonUpdatePhase {
+    fn decode(kind: &str, message: &RawValue) -> Result<DaemonUpdatePhase, PaseoError> {
+        decode_payload::<UpdateProgressed>(DAEMON_UPDATE_PROGRESS, kind, message)
+            .map(|progressed| progressed.phase)
+    }
 }
 
 fn decode_payload<T: DeserializeOwned>(
@@ -261,14 +560,25 @@ fn decode_payload<T: DeserializeOwned>(
     message: &RawValue,
 ) -> Result<T, PaseoError> {
     if kind != expected {
-        return Err(PaseoError::decode(
-            kind,
-            serde_json::Error::custom("message type does not belong to this subscription"),
-        ));
+        return Err(foreign_message(kind));
     }
     serde_json::from_str::<Payload<T>>(message.get())
         .map(|message| message.payload)
         .map_err(|error| PaseoError::decode(kind, error))
+}
+
+fn foreign_message(kind: &str) -> PaseoError {
+    PaseoError::decode(
+        kind,
+        serde_json::Error::custom("message type does not belong to this subscription"),
+    )
+}
+
+fn check_limit(name: &'static str, value: u32, max: u32) -> Result<(), ArgumentError> {
+    if !(1..=max).contains(&value) {
+        return Err(ArgumentError::LimitOutOfRange { name, value, max });
+    }
+    Ok(())
 }
 
 impl Routed for AgentUpdate {
@@ -292,6 +602,13 @@ impl Routed for TerminalsChanged {
 impl Routed for CheckoutDiff {
     fn decode(kind: &str, message: &RawValue) -> Result<CheckoutDiff, PaseoError> {
         decode_payload("checkout_diff_update", kind, message)
+    }
+}
+
+impl Routed for AgentReview {
+    fn decode(kind: &str, message: &RawValue) -> Result<AgentReview, PaseoError> {
+        decode_payload::<ReviewUpdate>("agent.review.update", kind, message)
+            .map(|update| update.review)
     }
 }
 
@@ -328,6 +645,19 @@ struct AgentTarget<'a> {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct WorkspaceScriptTarget<'a> {
+    workspace_id: &'a str,
+    script_name: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScheduleIdTarget<'a> {
+    schedule_id: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct WorkspaceTarget<'a> {
     workspace_id: &'a str,
 }
@@ -342,6 +672,29 @@ struct TerminalTarget<'a> {
 #[serde(rename_all = "camelCase")]
 struct CwdTarget<'a> {
     cwd: &'a str,
+}
+
+#[derive(Serialize)]
+struct PathTarget<'a> {
+    cwd: &'a str,
+    path: &'a str,
+}
+
+#[derive(Serialize)]
+struct BranchTarget<'a> {
+    cwd: &'a str,
+    branch: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectTarget<'a> {
+    project_id: &'a str,
+}
+
+#[derive(Serialize)]
+struct NameTarget<'a> {
+    name: &'a str,
 }
 
 #[derive(Serialize)]
@@ -399,9 +752,7 @@ impl AgentCreation {
     pub async fn finish(self) -> Result<AgentSnapshot, PaseoError> {
         let payload = self.creation.finish().await?;
         let created = PaseoClient::parse::<AgentCreated>(AGENT_CREATE, &payload)?;
-        created.agent.ok_or_else(|| {
-            PaseoError::request(AGENT_CREATE.kind, RequestFailure::MissingResult("agent"))
-        })
+        AGENT_CREATE.required(created.agent, "agent")
     }
 }
 
@@ -421,7 +772,52 @@ impl WorkspaceCreation {
     }
 }
 
+pub struct DaemonUpdate {
+    phases: flume::Receiver<Result<DaemonUpdatePhase, PaseoError>>,
+    pending: PendingReply,
+}
+
+impl DaemonUpdate {
+    pub fn phases(&self) -> &flume::Receiver<Result<DaemonUpdatePhase, PaseoError>> {
+        &self.phases
+    }
+
+    pub async fn finish(self) -> Result<DaemonUpdated, PaseoError> {
+        let payload = self.pending.wait(None).await?;
+        let finished = PaseoClient::parse::<DaemonUpdateFinished>(DAEMON_UPDATE, &payload)?;
+        DAEMON_UPDATE.accepted(finished.success)?;
+        Ok(finished.versions)
+    }
+}
+
+pub struct UsageReportFetch {
+    reports: flume::Receiver<Result<UsageReportEntry, PaseoError>>,
+    pending: PendingReply,
+}
+
+impl UsageReportFetch {
+    pub fn reports(&self) -> &flume::Receiver<Result<UsageReportEntry, PaseoError>> {
+        &self.reports
+    }
+
+    pub async fn finish(self) -> Result<(), PaseoError> {
+        let payload = self.pending.wait(Some(PROVIDER_CATALOGUE_TIMEOUT)).await?;
+        PaseoClient::parse::<Failure>(USAGE_REPORTS, &payload)?;
+        Ok(())
+    }
+}
+
 const AGENT_CREATE: Rpc = Rpc::new("agent.create.request", "agent.create.response");
+const DAEMON_UPDATE: Rpc = Rpc::new("daemon.update.request", "daemon.update.response");
+const FILE_ENTRY_CREATE: Rpc = Rpc::new("fs.entry.create.request", "fs.entry.create.response");
+const FILE_EXPLORER: Rpc = Rpc::new("file_explorer_request", "file_explorer_response");
+const FILE_WRITE: Rpc = Rpc::new("fs.file.write.request", "fs.file.write.response");
+const HOSTS_LIST: Rpc = Rpc::new("hosts.list.request", "hosts.list.response");
+const USAGE_REPORTS: Rpc = Rpc::new("usage.list_reports.request", "usage.list_reports.response");
+const WORKSPACE_LABEL_LIST: Rpc = Rpc::new(
+    "workspace.label.list.request",
+    "workspace.label.list.response",
+);
 const WORKSPACE_CREATE: Rpc = Rpc::new("workspace.create.request", "workspace.create.response");
 const PROCESS_SPAWN: Rpc = Rpc::new("process.spawn.request", "process.spawn.response");
 const NET_CONNECT: Rpc = Rpc::new("net.connect.request", "net.connect.response");
@@ -456,16 +852,18 @@ impl PaseoClient {
     }
 
     pub async fn connect_net(&self, host: &str, port: u16) -> Result<NetChannel, PaseoError> {
-        #[derive(Serialize)]
-        struct Body<'a> {
-            host: &'a str,
-            port: u16,
-        }
         self.require(DaemonFeature::StreamChannels)?;
+        self.open_net(&NetTarget::Tcp { host, port }).await
+    }
+
+    pub async fn connect_unix_socket(&self, path: &str) -> Result<NetChannel, PaseoError> {
+        self.require(DaemonFeature::StreamChannelUnixSockets)?;
+        self.open_net(&NetTarget::Unix { path }).await
+    }
+
+    async fn open_net(&self, target: &NetTarget<'_>) -> Result<NetChannel, PaseoError> {
         let channel = Arc::new(Channel::<NetClosed>::new(Arc::downgrade(&self.inner), true));
-        let opened = self
-            .open_channel(NET_CONNECT, &Body { host, port }, channel)
-            .await?;
+        let opened = self.open_channel(NET_CONNECT, target, channel).await?;
         Ok(NetChannel::new(opened.lease))
     }
 
@@ -484,7 +882,7 @@ impl PaseoClient {
         };
         let payload = self
             .inner
-            .submit(&request, Some(registration))?
+            .submit(&request, Some(registration), None)?
             .wait(Some(REQUEST_TIMEOUT))
             .await?;
         let subscription_id = Self::subscription_id(rpc, &payload)?;
@@ -504,10 +902,20 @@ impl PaseoClient {
     }
 
     fn parse<R: Response>(rpc: Rpc, payload: &RawValue) -> Result<R, PaseoError> {
-        let response = serde_json::from_str::<R>(payload.get())
-            .map_err(|error| PaseoError::decode(rpc.response, error))?;
+        let response =
+            serde_json::from_str::<R>(payload.get()).map_err(
+                |error| match serde_json::from_str::<Failure>(payload.get()) {
+                    Ok(Failure {
+                        error: Some(failure),
+                    }) => PaseoError::rpc(rpc.kind, failure),
+                    _ => PaseoError::decode(rpc.response, error),
+                },
+            )?;
         if let Some(error) = response.failure() {
             return Err(PaseoError::rpc(rpc.kind, error));
+        }
+        if let Some(error) = response.rejection() {
+            return Err(PaseoError::checkout(rpc.kind, error.clone()));
         }
         Ok(response)
     }
@@ -527,7 +935,11 @@ impl PaseoClient {
             response_type: rpc.response,
             body,
         };
-        let payload = self.inner.submit(&request, None)?.wait(timeout).await?;
+        let payload = self
+            .inner
+            .submit(&request, None, None)?
+            .wait(timeout)
+            .await?;
         Self::parse(rpc, &payload)
     }
 
@@ -536,9 +948,7 @@ impl PaseoClient {
         rpc: Rpc,
         body: &B,
     ) -> Result<T, PaseoError> {
-        let payload = self.call::<_, Box<RawValue>>(rpc, body).await?;
-        Self::parse::<Failure>(rpc, &payload)?;
-        serde_json::from_str(payload.get()).map_err(|error| PaseoError::decode(rpc.response, error))
+        Ok(self.call::<_, Checked<T>>(rpc, body).await?.value)
     }
 
     async fn observe<B: Serialize, S: Response, T, U: Routed>(
@@ -553,25 +963,28 @@ impl PaseoClient {
             response_type: rpc.response,
             body,
         };
-        let registration = Inner::route_registration(updates, rpc.response);
+        let registration = Inner::route_registration(updates);
         let payload = self
             .inner
-            .submit(&request, Some(registration))?
+            .submit(&request, Some(registration), None)?
             .wait(Some(REQUEST_TIMEOUT))
             .await?;
-        let id = Self::subscription_id(rpc, &payload)?;
-        match Self::parse::<S>(rpc, &payload) {
-            Ok(response) => Ok(Subscription::new(
-                id,
-                snapshot(response),
-                receiver,
-                &self.inner,
-            )),
+        let response = match Self::parse::<S>(rpc, &payload) {
+            Ok(response) => response,
             Err(error) => {
-                self.inner.release(&id);
-                Err(error)
+                if let Ok(id) = Self::subscription_id(rpc, &payload) {
+                    self.inner.release(&id);
+                }
+                return Err(error);
             }
-        }
+        };
+        let id = Self::subscription_id(rpc, &payload)?;
+        Ok(Subscription::new(
+            id,
+            snapshot(response),
+            receiver,
+            &self.inner,
+        ))
     }
 
     fn subscription_id(rpc: Rpc, payload: &RawValue) -> Result<String, PaseoError> {
@@ -686,6 +1099,7 @@ impl PaseoClient {
             cwd: &'a str,
             compare: &'a DiffCompare,
         }
+        self.require_diff_mode(compare)?;
         let rpc = Rpc::new(
             "subscribe_checkout_diff_request",
             "subscribe_checkout_diff_response",
@@ -716,7 +1130,7 @@ impl PaseoClient {
         };
         let payload = self
             .inner
-            .submit(&request, Some(Inner::terminal_registration(events)))?
+            .submit(&request, Some(Inner::terminal_registration(events)), None)?
             .wait(Some(REQUEST_TIMEOUT))
             .await?;
         let id = Self::subscription_id(rpc, &payload)?;
@@ -871,6 +1285,7 @@ impl PaseoClient {
                 body,
             },
             None,
+            None,
         )?;
         Ok(PendingCreation {
             registration,
@@ -895,10 +1310,7 @@ impl PaseoClient {
         let response = self
             .call::<_, SendResponse>(rpc, &Body { agent_id, message })
             .await?;
-        if !response.accepted {
-            return Err(PaseoError::request(rpc.kind, RequestFailure::Declined));
-        }
-        Ok(())
+        rpc.accepted(response.accepted)
     }
 
     pub async fn cancel_agent(&self, agent_id: &str) -> Result<(), PaseoError> {
@@ -929,9 +1341,7 @@ impl PaseoClient {
         body: &B,
     ) -> Result<AgentActionOutcome, PaseoError> {
         let response = self.call::<_, ActionResponse>(rpc, body).await?;
-        if !response.accepted {
-            return Err(PaseoError::request(rpc.kind, RequestFailure::Declined));
-        }
+        rpc.accepted(response.accepted)?;
         Ok(AgentActionOutcome::new(response.agent_id, response.notice))
     }
 
@@ -1054,6 +1464,46 @@ impl PaseoClient {
         .await
     }
 
+    /// Sets or removes labels: a `None` value removes that label.
+    pub async fn update_agent_labels(
+        &self,
+        agent_id: &str,
+        labels: &HashMap<String, Option<String>>,
+    ) -> Result<AgentActionOutcome, PaseoError> {
+        if labels.values().any(Option::is_none) {
+            self.require(DaemonFeature::AgentOrganization)?;
+        }
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            agent_id: &'a str,
+            labels: &'a HashMap<String, Option<String>>,
+        }
+        let rpc = Rpc::new("update_agent_request", "update_agent_response");
+        self.agent_action(rpc, &Body { agent_id, labels }).await
+    }
+
+    /// Pins or unpins an agent, returning when it was pinned.
+    pub async fn set_agent_pinned(
+        &self,
+        agent_id: &str,
+        pinned: bool,
+    ) -> Result<Option<String>, PaseoError> {
+        self.require(DaemonFeature::AgentOrganization)?;
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            agent_id: &'a str,
+            pinned: bool,
+        }
+        let rpc = Rpc::new("agent.pin.set.request", "agent.pin.set.response");
+        let response = self
+            .call::<_, Pinned>(rpc, &Body { agent_id, pinned })
+            .await?;
+        rpc.accepted(response.accepted)?;
+        Ok(response.pinned_at)
+    }
+
     pub async fn detach_agent(&self, agent_id: &str) -> Result<AgentActionOutcome, PaseoError> {
         let rpc = Rpc::new("agent.detach.request", "agent.detach.response");
         self.agent_action(rpc, &AgentTarget { agent_id }).await
@@ -1083,10 +1533,7 @@ impl PaseoClient {
                 },
             )
             .await?;
-        if !response.ok {
-            return Err(PaseoError::request(rpc.kind, RequestFailure::Declined));
-        }
-        Ok(())
+        rpc.accepted(response.ok)
     }
 
     async fn agent_status(
@@ -1117,9 +1564,10 @@ impl PaseoClient {
             overrides: Option<&'a AgentSessionConfig>,
         }
         let rpc = Rpc::new("resume_agent_request", "status");
-        self.agent_status(rpc, &Body { handle, overrides }, "agent_resumed")
-            .await?
-            .ok_or_else(|| PaseoError::request(rpc.kind, RequestFailure::MissingResult("agent")))
+        let agent = self
+            .agent_status(rpc, &Body { handle, overrides }, "agent_resumed")
+            .await?;
+        rpc.required(agent, "agent")
     }
 
     pub async fn import_agent(
@@ -1127,9 +1575,8 @@ impl PaseoClient {
         request: &ImportAgentRequest,
     ) -> Result<AgentSnapshot, PaseoError> {
         let rpc = Rpc::new("import_agent_request", "status");
-        self.agent_status(rpc, request, "agent_resumed")
-            .await?
-            .ok_or_else(|| PaseoError::request(rpc.kind, RequestFailure::MissingResult("agent")))
+        let agent = self.agent_status(rpc, request, "agent_resumed").await?;
+        rpc.required(agent, "agent")
     }
 
     pub async fn refresh_agent(&self, agent_id: &str) -> Result<(), PaseoError> {
@@ -1166,6 +1613,116 @@ impl PaseoClient {
             timeout.map(|timeout| timeout.saturating_add(REQUEST_TIMEOUT)),
         )
         .await
+    }
+
+    pub async fn observe_agent_review(
+        &self,
+        agent_id: &str,
+    ) -> Result<Subscription<AgentReview, AgentReview>, PaseoError> {
+        self.require(DaemonFeature::AgentReview)?;
+        let rpc = Rpc::new(
+            "agent.review.subscribe.request",
+            "agent.review.subscribe.response",
+        );
+        self.observe(
+            rpc,
+            &AgentTarget { agent_id },
+            |subscribed: Checked<ReviewSubscribed>| subscribed.value.review,
+        )
+        .await
+    }
+
+    pub async fn mark_review_seen(
+        &self,
+        agent_id: &str,
+        files: &[SeenFile],
+    ) -> Result<(), PaseoError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            agent_id: &'a str,
+            files: &'a [SeenFile],
+        }
+        self.require(DaemonFeature::AgentReview)?;
+        let rpc = Rpc::new(
+            "agent.review.mark_seen.request",
+            "agent.review.mark_seen.response",
+        );
+        self.call::<_, Failure>(rpc, &Body { agent_id, files })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn mark_review_unseen(
+        &self,
+        agent_id: &str,
+        files: &[FileReference],
+    ) -> Result<(), PaseoError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            agent_id: &'a str,
+            files: &'a [FileReference],
+        }
+        self.require(DaemonFeature::AgentReview)?;
+        let rpc = Rpc::new(
+            "agent.review.mark_unseen.request",
+            "agent.review.mark_unseen.response",
+        );
+        self.call::<_, Failure>(rpc, &Body { agent_id, files })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn save_review_comment(
+        &self,
+        agent_id: &str,
+        comment: &ReviewCommentInput,
+    ) -> Result<(), PaseoError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            agent_id: &'a str,
+            comment: &'a ReviewCommentInput,
+        }
+        self.require(DaemonFeature::AgentReview)?;
+        if comment.side() == CommentSide::Old {
+            self.require(DaemonFeature::AgentReviewRemovedLines)?;
+        }
+        let rpc = Rpc::new(
+            "agent.review.save_comment.request",
+            "agent.review.save_comment.response",
+        );
+        self.call::<_, Failure>(rpc, &Body { agent_id, comment })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_review_comment(
+        &self,
+        agent_id: &str,
+        comment_id: &str,
+    ) -> Result<(), PaseoError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            agent_id: &'a str,
+            comment_id: &'a str,
+        }
+        self.require(DaemonFeature::AgentReview)?;
+        let rpc = Rpc::new(
+            "agent.review.delete_comment.request",
+            "agent.review.delete_comment.response",
+        );
+        self.call::<_, Failure>(
+            rpc,
+            &Body {
+                agent_id,
+                comment_id,
+            },
+        )
+        .await?;
+        Ok(())
     }
 
     pub async fn list_prompts(&self, agent_id: &str) -> Result<Vec<PromptPreview>, PaseoError> {
@@ -1225,6 +1782,13 @@ impl PaseoClient {
                 response,
             },
         )?;
+        self.inner.send(Frame::Text(text))
+    }
+
+    /// Tells the daemon whether the user is here and what they're looking at. Only clients that
+    /// send heartbeats are picked to notify about agents.
+    pub fn send_heartbeat(&self, heartbeat: &ClientHeartbeat) -> Result<(), PaseoError> {
+        let text = session_message("client_heartbeat", None, heartbeat)?;
         self.inner.send(Frame::Text(text))
     }
 
@@ -1368,14 +1932,10 @@ impl PaseoClient {
             "refresh_providers_snapshot_request",
             "refresh_providers_snapshot_response",
         );
-        if !self
+        let refreshed = self
             .call::<_, RefreshAcknowledged>(rpc, &Body { cwd, providers })
-            .await?
-            .acknowledged
-        {
-            return Err(PaseoError::request(rpc.kind, RequestFailure::Declined));
-        }
-        Ok(())
+            .await?;
+        rpc.accepted(refreshed.acknowledged)
     }
 
     pub async fn list_provider_subagents(
@@ -1429,20 +1989,18 @@ impl PaseoClient {
 
     pub async fn open_project(&self, cwd: &str) -> Result<WorkspaceDescriptor, PaseoError> {
         let rpc = Rpc::new("open_project_request", "open_project_response");
-        self.call::<_, ProjectOpened>(rpc, &CwdTarget { cwd })
-            .await?
-            .workspace
-            .ok_or_else(|| {
-                PaseoError::request(rpc.kind, RequestFailure::MissingResult("workspace"))
-            })
+        let opened = self
+            .call::<_, ProjectOpened>(rpc, &CwdTarget { cwd })
+            .await?;
+        rpc.required(opened.workspace, "workspace")
     }
 
     pub async fn add_project(&self, cwd: &str) -> Result<ProjectDescriptor, PaseoError> {
         let rpc = Rpc::new("project.add.request", "project.add.response");
-        self.call::<_, ProjectAdded>(rpc, &CwdTarget { cwd })
-            .await?
-            .project
-            .ok_or_else(|| PaseoError::request(rpc.kind, RequestFailure::MissingResult("project")))
+        let added = self
+            .call::<_, ProjectAdded>(rpc, &CwdTarget { cwd })
+            .await?;
+        rpc.required(added.project, "project")
     }
 
     pub async fn create_project_directory(
@@ -1460,12 +2018,10 @@ impl PaseoClient {
             "project.create_directory.request",
             "project.create_directory.response",
         );
-        self.call::<_, DirectoryCreated>(rpc, &Body { parent_path, name })
-            .await?
-            .directory_path
-            .ok_or_else(|| {
-                PaseoError::request(rpc.kind, RequestFailure::MissingResult("directory"))
-            })
+        let created = self
+            .call::<_, DirectoryCreated>(rpc, &Body { parent_path, name })
+            .await?;
+        rpc.required(created.directory_path, "directory")
     }
 
     pub async fn clone_github_project(
@@ -1493,14 +2049,12 @@ impl PaseoClient {
                 Some(GITHUB_CLONE_TIMEOUT),
             )
             .await?;
-        response
-            .checkout_path
-            .or_else(|| {
-                response
-                    .project
-                    .map(|project| project.project_root_path().to_owned())
-            })
-            .ok_or_else(|| PaseoError::request(rpc.kind, RequestFailure::MissingResult("project")))
+        let checkout_path = response.checkout_path.or_else(|| {
+            response
+                .project
+                .map(|project| project.project_root_path().to_owned())
+        });
+        rpc.required(checkout_path, "project")
     }
 
     pub async fn set_workspace_title(
@@ -1527,10 +2081,7 @@ impl PaseoClient {
                 },
             )
             .await?;
-        if !response.accepted {
-            return Err(PaseoError::request(rpc.kind, RequestFailure::Declined));
-        }
-        Ok(())
+        rpc.accepted(response.accepted)
     }
 
     pub async fn archive_workspace(
@@ -1583,16 +2134,11 @@ impl PaseoClient {
         #[derive(Deserialize)]
         struct Listed {
             worktrees: Vec<PaseoWorktree>,
-            error: Option<CheckoutError>,
-        }
-        impl Response for Listed {
-            fn failure(&self) -> Option<&str> {
-                self.error.as_ref().map(CheckoutError::message)
-            }
         }
         Ok(self
-            .call::<_, Listed>(rpc, &CwdTarget { cwd })
+            .call::<_, CheckoutResult<Listed>>(rpc, &CwdTarget { cwd })
             .await?
+            .value
             .worktrees)
     }
 
@@ -1639,9 +2185,7 @@ impl PaseoClient {
         rpc: Rpc,
         creation: WorkspaceCreated,
     ) -> Result<CreatedWorkspace, PaseoError> {
-        let workspace = creation.workspace.ok_or_else(|| {
-            PaseoError::request(rpc.kind, RequestFailure::MissingResult("workspace"))
-        })?;
+        let workspace = rpc.required(creation.workspace, "workspace")?;
         Ok(CreatedWorkspace::new(
             workspace,
             creation.agent,
@@ -1676,15 +2220,7 @@ impl PaseoClient {
             query: &'a str,
             limit: u32,
         }
-        const MAX_LIMIT: u32 = 200;
-        if !(1..=MAX_LIMIT).contains(&limit) {
-            return Err(ArgumentError::LimitOutOfRange {
-                name: "branch suggestion limit",
-                value: limit,
-                max: MAX_LIMIT,
-            }
-            .into());
-        }
+        check_limit("branch suggestion limit", limit, 200)?;
         let rpc = Rpc::new("branch_suggestions_request", "branch_suggestions_response");
         Ok(self
             .call::<_, BranchSuggestions>(rpc, &Body { cwd, query, limit })
@@ -1697,6 +2233,295 @@ impl PaseoClient {
         self.call(rpc, &CwdTarget { cwd }).await
     }
 
+    async fn checkout_mutation<B: Serialize>(&self, rpc: Rpc, body: &B) -> Result<(), PaseoError> {
+        let done = self
+            .call_within::<_, CheckoutResult<CheckoutDone>>(
+                rpc,
+                body,
+                Some(CHECKOUT_MUTATION_TIMEOUT),
+            )
+            .await?;
+        rpc.accepted(done.value.success)
+    }
+
+    /// Merges the checkout's branch into its base (or `base_ref`).
+    pub async fn checkout_merge(
+        &self,
+        cwd: &str,
+        base_ref: Option<&str>,
+        strategy: MergeStrategy,
+        require_clean_target: bool,
+    ) -> Result<(), PaseoError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            cwd: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            base_ref: Option<&'a str>,
+            strategy: MergeStrategy,
+            require_clean_target: bool,
+        }
+        let rpc = Rpc::new("checkout_merge_request", "checkout_merge_response");
+        self.checkout_mutation(
+            rpc,
+            &Body {
+                cwd,
+                base_ref,
+                strategy,
+                require_clean_target,
+            },
+        )
+        .await
+    }
+
+    /// Merges the checkout's base (or `base_ref`) into its branch.
+    pub async fn checkout_merge_from_base(
+        &self,
+        cwd: &str,
+        base_ref: Option<&str>,
+        require_clean_target: bool,
+    ) -> Result<(), PaseoError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            cwd: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            base_ref: Option<&'a str>,
+            require_clean_target: bool,
+        }
+        let rpc = Rpc::new(
+            "checkout_merge_from_base_request",
+            "checkout_merge_from_base_response",
+        );
+        self.checkout_mutation(
+            rpc,
+            &Body {
+                cwd,
+                base_ref,
+                require_clean_target,
+            },
+        )
+        .await
+    }
+
+    pub async fn checkout_push(&self, cwd: &str) -> Result<(), PaseoError> {
+        let rpc = Rpc::new("checkout_push_request", "checkout_push_response");
+        self.checkout_mutation(rpc, &CwdTarget { cwd }).await
+    }
+
+    /// Opens a pull request for the checkout's branch. The daemon writes a missing title or body.
+    pub async fn create_pull_request(
+        &self,
+        cwd: &str,
+        title: Option<&str>,
+        body: Option<&str>,
+        base_ref: Option<&str>,
+    ) -> Result<CreatedPullRequest, PaseoError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            cwd: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            title: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            body: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            base_ref: Option<&'a str>,
+        }
+        let rpc = Rpc::new("checkout_pr_create_request", "checkout_pr_create_response");
+        let created = self
+            .call_within::<_, CheckoutResult<PullRequestCreated>>(
+                rpc,
+                &Body {
+                    cwd,
+                    title,
+                    body,
+                    base_ref,
+                },
+                Some(CHECKOUT_MUTATION_TIMEOUT),
+            )
+            .await?
+            .value;
+        let url = rpc.required(created.url, "pull request url")?;
+        Ok(CreatedPullRequest::new(url, created.number))
+    }
+
+    /// The pull request for the checkout's branch and whether its forge can be used.
+    pub async fn pull_request_status(&self, cwd: &str) -> Result<ForgeStatus, PaseoError> {
+        let rpc = Rpc::new("checkout_pr_status_request", "checkout_pr_status_response");
+        self.call(rpc, &CwdTarget { cwd }).await
+    }
+
+    pub async fn pull_request_timeline(
+        &self,
+        cwd: &str,
+        pr_number: u64,
+        repo_owner: &str,
+        repo_name: &str,
+    ) -> Result<PullRequestTimeline, PaseoError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            cwd: &'a str,
+            pr_number: u64,
+            repo_owner: &'a str,
+            repo_name: &'a str,
+        }
+        let rpc = Rpc::new(
+            "pull_request_timeline_request",
+            "pull_request_timeline_response",
+        );
+        self.call(
+            rpc,
+            &Body {
+                cwd,
+                pr_number,
+                repo_owner,
+                repo_name,
+            },
+        )
+        .await
+    }
+
+    pub async fn provider_usage(&self) -> Result<ProviderUsageList, PaseoError> {
+        self.require(DaemonFeature::ProviderUsageList)?;
+        let rpc = Rpc::new(
+            "provider.usage.list.request",
+            "provider.usage.list.response",
+        );
+        self.call_checked(rpc, &NoFields {}).await
+    }
+
+    pub async fn list_workspace_scripts(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<WorkspaceScript>, PaseoError> {
+        let rpc = Rpc::new(
+            "workspace.script.list.request",
+            "workspace.script.list.response",
+        );
+        Ok(self
+            .call::<_, ScriptsListed>(rpc, &WorkspaceTarget { workspace_id })
+            .await?
+            .scripts)
+    }
+
+    pub async fn start_workspace_script(
+        &self,
+        workspace_id: &str,
+        script_name: &str,
+    ) -> Result<(), PaseoError> {
+        let rpc = Rpc::new(
+            "workspace.script.start.request",
+            "workspace.script.start.response",
+        );
+        self.call::<_, Failure>(
+            rpc,
+            &WorkspaceScriptTarget {
+                workspace_id,
+                script_name,
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn stop_workspace_script(
+        &self,
+        workspace_id: &str,
+        script_name: &str,
+    ) -> Result<(), PaseoError> {
+        let rpc = Rpc::new(
+            "workspace.script.stop.request",
+            "workspace.script.stop.response",
+        );
+        self.call::<_, Failure>(
+            rpc,
+            &WorkspaceScriptTarget {
+                workspace_id,
+                script_name,
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Allows and runs a workspace setup that the daemon blocked, such as one from an untrusted
+    /// pull request source. Returns whether setup started: the daemon starts nothing for a
+    /// workspace whose setup wasn't blocked.
+    pub async fn run_workspace_setup(&self, workspace_id: &str) -> Result<bool, PaseoError> {
+        self.require(DaemonFeature::WorkspaceSetupRun)?;
+        let rpc = Rpc::new(
+            "workspace.setup.run.request",
+            "workspace.setup.run.response",
+        );
+        let setup = self
+            .call::<_, SetupStarted>(rpc, &WorkspaceTarget { workspace_id })
+            .await?;
+        Ok(setup.started)
+    }
+
+    pub async fn list_schedules(&self) -> Result<Vec<Schedule>, PaseoError> {
+        let rpc = Rpc::new("schedule/list", "schedule/list/response");
+        Ok(self
+            .call::<_, SchedulesListed>(rpc, &NoFields {})
+            .await?
+            .schedules)
+    }
+
+    pub async fn create_schedule(&self, schedule: &ScheduleCreate) -> Result<Schedule, PaseoError> {
+        let rpc = Rpc::new("schedule/create", "schedule/create/response");
+        let created = self.call::<_, ScheduleFetched>(rpc, schedule).await?;
+        rpc.required(created.schedule, "schedule")
+    }
+
+    async fn schedule_change(
+        &self,
+        rpc: Rpc,
+        schedule_id: &str,
+        timeout: Option<Duration>,
+    ) -> Result<Schedule, PaseoError> {
+        let changed = self
+            .call_within::<_, ScheduleFetched>(rpc, &ScheduleIdTarget { schedule_id }, timeout)
+            .await?;
+        rpc.required(changed.schedule, "schedule")
+    }
+
+    pub async fn pause_schedule(&self, schedule_id: &str) -> Result<Schedule, PaseoError> {
+        let rpc = Rpc::new("schedule/pause", "schedule/pause/response");
+        self.schedule_change(rpc, schedule_id, Some(REQUEST_TIMEOUT))
+            .await
+    }
+
+    pub async fn resume_schedule(&self, schedule_id: &str) -> Result<Schedule, PaseoError> {
+        let rpc = Rpc::new("schedule/resume", "schedule/resume/response");
+        self.schedule_change(rpc, schedule_id, Some(REQUEST_TIMEOUT))
+            .await
+    }
+
+    /// Runs a schedule now. The daemon answers only once the run has finished, so this waits
+    /// without a timeout.
+    pub async fn run_schedule_once(&self, schedule_id: &str) -> Result<(), PaseoError> {
+        let rpc = Rpc::new("schedule/run-once", "schedule/run-once/response");
+        self.schedule_change(rpc, schedule_id, None).await?;
+        Ok(())
+    }
+
+    pub async fn delete_schedule(&self, schedule_id: &str) -> Result<(), PaseoError> {
+        let rpc = Rpc::new("schedule/delete", "schedule/delete/response");
+        self.call::<_, Failure>(rpc, &ScheduleIdTarget { schedule_id })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn schedule_runs(&self, schedule_id: &str) -> Result<Vec<ScheduleRun>, PaseoError> {
+        let rpc = Rpc::new("schedule/logs", "schedule/logs/response");
+        Ok(self
+            .call::<_, ScheduleRunsListed>(rpc, &ScheduleIdTarget { schedule_id })
+            .await?
+            .runs)
+    }
+
     pub async fn write_text_file(
         &self,
         cwd: &str,
@@ -1704,15 +2529,6 @@ impl PaseoClient {
         name: &str,
         content: &str,
     ) -> Result<String, PaseoError> {
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Write<'a> {
-            cwd: &'a str,
-            path: &'a str,
-            content: &'a str,
-            #[serde(flatten)]
-            expected: &'a ExpectedVersion,
-        }
         let parents = parent_path
             .split('/')
             .filter(|segment| !matches!(*segment, "" | "."))
@@ -1735,44 +2551,41 @@ impl PaseoClient {
             .chain([name])
             .collect::<Vec<_>>()
             .join("/");
-        let write = Rpc::new("fs.file.write.request", "fs.file.write.response");
-        let mut expected = ExpectedVersion::default();
+        let mut expected = FileRevision::new(String::new(), None);
         let mut created = false;
         let mut refreshed = false;
         loop {
-            let body = Write {
-                cwd,
-                path: &path,
-                content,
-                expected: &expected,
+            let write = FileWrite::text(path.as_str(), content, &expected);
+            let conflict = match self.write_file(cwd, &write).await? {
+                FileWriteOutcome::Written(_) => return Ok(path),
+                FileWriteOutcome::Error { error } => {
+                    return Err(PaseoError::rpc(FILE_WRITE.kind, error));
+                }
+                FileWriteOutcome::Conflict { version } => version,
+                FileWriteOutcome::Unknown => {
+                    return Err(PaseoError::request(
+                        FILE_WRITE.kind,
+                        RequestFailure::UnrecognisedOutcome,
+                    ));
+                }
             };
-            match self.call::<_, FileWritten>(write, &body).await?.result {
-                FileWriteResult::Written {} => return Ok(path),
-                FileWriteResult::Error { error }
-                | FileWriteResult::Conflict {
-                    version: FileVersion::Error { error },
-                } => return Err(PaseoError::rpc(write.kind, error)),
-                FileWriteResult::Conflict {
-                    version: FileVersion::Missing {},
-                } if !created => {
+            match conflict.state() {
+                FileState::Error { error } => {
+                    return Err(PaseoError::rpc(FILE_WRITE.kind, error.as_str()));
+                }
+                FileState::Missing if !created => {
                     self.create_file(cwd, &parents, name).await?;
                     created = true;
                 }
-                FileWriteResult::Conflict {
-                    version:
-                        FileVersion::Ready {
-                            modified_at,
-                            revision,
-                        },
-                } if !refreshed => {
-                    expected = ExpectedVersion {
-                        expected_modified_at: modified_at,
-                        expected_revision: revision,
-                    };
+                FileState::Ready(ready) if !refreshed => {
+                    expected = ready.revision().clone();
                     refreshed = true;
                 }
-                FileWriteResult::Conflict { .. } => {
-                    return Err(PaseoError::request(write.kind, RequestFailure::FileChanged));
+                FileState::Missing | FileState::Ready(_) | FileState::Unknown => {
+                    return Err(PaseoError::request(
+                        FILE_WRITE.kind,
+                        RequestFailure::FileChanged,
+                    ));
                 }
             }
         }
@@ -1781,23 +2594,24 @@ impl PaseoClient {
     async fn create_file(&self, cwd: &str, parents: &[&str], name: &str) -> Result<(), PaseoError> {
         let mut parent = String::from(".");
         for segment in parents {
-            let existing = self
-                .list_directory(cwd, &parent)
-                .await?
-                .into_iter()
-                .find(|entry| entry.name == *segment);
-            match existing.map(|entry| entry.kind) {
+            let listing = self.list_directory(cwd, &parent).await?;
+            let existing = listing
+                .entries()
+                .iter()
+                .find(|entry| entry.name() == *segment)
+                .map(FileEntry::kind);
+            match existing {
                 Some(EntryKind::Directory) => {}
-                Some(EntryKind::File) => {
+                Some(EntryKind::File | EntryKind::Unknown) => {
                     return Err(PaseoError::request(
-                        "fs.entry.create.request",
+                        FILE_ENTRY_CREATE.kind,
                         RequestFailure::NotADirectory {
                             path: format!("{parent}/{segment}"),
                         },
                     ));
                 }
                 None => {
-                    self.create_entry(cwd, &parent, segment, EntryKind::Directory)
+                    self.create_file_entry(cwd, &parent, segment, EntryKind::Directory)
                         .await?;
                 }
             }
@@ -1806,63 +2620,8 @@ impl PaseoClient {
                 _ => format!("{parent}/{segment}"),
             };
         }
-        self.create_entry(cwd, &parent, name, EntryKind::File).await
-    }
-
-    async fn list_directory(&self, cwd: &str, path: &str) -> Result<Vec<ListedEntry>, PaseoError> {
-        #[derive(Serialize)]
-        struct Body<'a> {
-            cwd: &'a str,
-            path: &'a str,
-            mode: &'static str,
-        }
-        let rpc = Rpc::new("file_explorer_request", "file_explorer_response");
-        let listed = self
-            .call::<_, DirectoryListed>(
-                rpc,
-                &Body {
-                    cwd,
-                    path,
-                    mode: "list",
-                },
-            )
+        self.create_file_entry(cwd, &parent, name, EntryKind::File)
             .await?;
-        let directory = listed.directory.ok_or(PaseoError::request(
-            rpc.kind,
-            RequestFailure::MissingResult("directory"),
-        ))?;
-        Ok(directory.entries)
-    }
-
-    async fn create_entry(
-        &self,
-        cwd: &str,
-        parent_path: &str,
-        name: &str,
-        kind: EntryKind,
-    ) -> Result<(), PaseoError> {
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Create<'a> {
-            cwd: &'a str,
-            parent_path: &'a str,
-            name: &'a str,
-            kind: EntryKind,
-        }
-        let rpc = Rpc::new("fs.entry.create.request", "fs.entry.create.response");
-        let body = Create {
-            cwd,
-            parent_path,
-            name,
-            kind,
-        };
-        let created = self.call::<_, EntryCreated>(rpc, &body).await?;
-        if !created.success || created.path.is_none() {
-            return Err(PaseoError::request(
-                rpc.kind,
-                RequestFailure::MissingResult("path"),
-            ));
-        }
         Ok(())
     }
 
@@ -1898,10 +2657,10 @@ impl PaseoClient {
             options: &'a CreateTerminalOptions,
         }
         let rpc = Rpc::new("create_terminal_request", "create_terminal_response");
-        self.call::<_, TerminalCreated>(rpc, &Body { cwd, options })
-            .await?
-            .terminal
-            .ok_or_else(|| PaseoError::request(rpc.kind, RequestFailure::MissingResult("terminal")))
+        let created = self
+            .call::<_, TerminalCreated>(rpc, &Body { cwd, options })
+            .await?;
+        rpc.required(created.terminal, "terminal")
     }
 
     pub async fn rename_terminal(&self, terminal_id: &str, title: &str) -> Result<(), PaseoError> {
@@ -1915,10 +2674,7 @@ impl PaseoClient {
         let response = self
             .call::<_, TerminalRenamed>(rpc, &Body { terminal_id, title })
             .await?;
-        if !response.success {
-            return Err(PaseoError::request(rpc.kind, RequestFailure::Declined));
-        }
-        Ok(())
+        rpc.accepted(response.success)
     }
 
     pub async fn kill_terminal(&self, terminal_id: &str) -> Result<(), PaseoError> {
@@ -1928,14 +2684,10 @@ impl PaseoClient {
         }
         impl Response for Killed {}
         let rpc = Rpc::new("kill_terminal_request", "kill_terminal_response");
-        if !self
+        let killed = self
             .call::<_, Killed>(rpc, &TerminalTarget { terminal_id })
-            .await?
-            .success
-        {
-            return Err(PaseoError::request(rpc.kind, RequestFailure::Declined));
-        }
-        Ok(())
+            .await?;
+        rpc.accepted(killed.success)
     }
 
     /// The terminal's lines, without escape sequences. Unlike [`Self::subscribe_terminal`],
@@ -2013,7 +2765,7 @@ impl PaseoClient {
                 modified_at,
             },
         };
-        let pending = self.inner.submit(&request, None)?;
+        let pending = self.inner.submit(&request, None, None)?;
         let metadata = serde_json::to_vec(&Metadata {
             mime: mime_type,
             size: bytes.len(),
@@ -2043,10 +2795,9 @@ impl PaseoClient {
                 })?;
             self.inner.send(Frame::Binary(frame))?;
         }
-        let payload = pending.wait(Some(UPLOAD_TIMEOUT)).await?;
-        Self::parse::<FileUploaded>(rpc, &payload)?
-            .file
-            .ok_or_else(|| PaseoError::request(rpc.kind, RequestFailure::MissingResult("file")))
+        let payload = pending.wait(Some(FILE_TRANSFER_TIMEOUT)).await?;
+        let uploaded = Self::parse::<FileUploaded>(rpc, &payload)?;
+        rpc.required(uploaded.file, "file")
     }
 
     /// Asks the daemon's supervisor to replace its worker. The supervisor keeps running, so the
@@ -2056,20 +2807,11 @@ impl PaseoClient {
         struct Body<'a> {
             reason: &'a str,
         }
-        #[derive(Deserialize)]
-        struct Status {
-            status: String,
-        }
-        impl Response for Status {}
         let rpc = Rpc::new("restart_server_request", "status");
-        let response = self.call::<_, Status>(rpc, &Body { reason }).await?;
-        if response.status != "restart_requested" {
-            return Err(PaseoError::request(
-                rpc.kind,
-                RequestFailure::UnexpectedStatus(response.status),
-            ));
-        }
-        Ok(())
+        let response = self
+            .call::<_, ServerStatusReply>(rpc, &Body { reason })
+            .await?;
+        response.confirm(rpc, ServerStatus::RestartRequested)
     }
 
     pub async fn daemon_status(&self) -> Result<DaemonStatus, PaseoError> {
@@ -2079,6 +2821,1500 @@ impl PaseoClient {
             &NoFields {},
         )
         .await
+    }
+
+    pub async fn list_directory(
+        &self,
+        cwd: &str,
+        path: &str,
+    ) -> Result<DirectoryListing, PaseoError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            cwd: &'a str,
+            path: &'a str,
+            mode: &'static str,
+        }
+        let listed = self
+            .call::<_, Explored>(
+                FILE_EXPLORER,
+                &Body {
+                    cwd,
+                    path,
+                    mode: "list",
+                },
+            )
+            .await?;
+        FILE_EXPLORER.required(listed.directory, "directory")
+    }
+
+    pub async fn read_file(
+        &self,
+        cwd: &str,
+        path: &str,
+        max_bytes: Option<NonZeroU64>,
+    ) -> Result<FileContent, PaseoError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            cwd: &'a str,
+            path: &'a str,
+            mode: &'static str,
+            accept_binary: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            max_bytes: Option<NonZeroU64>,
+        }
+        let (finished, downloaded) = oneshot::channel();
+        let request = Request {
+            kind: FILE_EXPLORER.kind,
+            response_type: FILE_EXPLORER.response,
+            body: &Body {
+                cwd,
+                path,
+                mode: "file",
+                accept_binary: true,
+                max_bytes,
+            },
+        };
+        let pending = self.inner.submit(
+            &request,
+            None,
+            Some(Tracking::Download(Download::new(path, finished))),
+        )?;
+        let reply = pin!(pending.wait(Some(FILE_TRANSFER_TIMEOUT)));
+        let payload = match future::select(downloaded, reply).await {
+            Either::Left((Ok(content), _)) => return content,
+            Either::Left((Err(_), reply)) => reply.await?,
+            Either::Right((reply, _)) => reply?,
+        };
+        let explored = Self::parse::<Explored>(FILE_EXPLORER, &payload)?;
+        let file = FILE_EXPLORER.required(explored.file, "file")?;
+        file.into_content().map_err(|error| {
+            PaseoError::decode(FILE_EXPLORER.response, serde_json::Error::custom(error))
+        })
+    }
+
+    pub async fn observe_file(
+        &self,
+        cwd: &str,
+        path: &str,
+    ) -> Result<Subscription<FileVersion, FileVersion>, PaseoError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            cwd: &'a str,
+            path: &'a str,
+        }
+        self.require(DaemonFeature::WorkspaceFileEditing)?;
+        let rpc = Rpc::new("fs.file.subscribe.request", "fs.file.subscribe.response");
+        self.observe(
+            rpc,
+            &Body { cwd, path },
+            |subscribed: Checked<FileSubscribed>| subscribed.value.initial,
+        )
+        .await
+    }
+
+    pub async fn write_file(
+        &self,
+        cwd: &str,
+        write: &FileWrite,
+    ) -> Result<FileWriteOutcome, PaseoError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            cwd: &'a str,
+            #[serde(flatten)]
+            write: &'a FileWrite,
+        }
+        self.require(DaemonFeature::WorkspaceFileEditing)?;
+        if write.content_encoding() == ContentEncoding::Base64 {
+            self.require(DaemonFeature::FileByteWrites)?;
+        }
+        Ok(self
+            .call::<_, FileWritten>(FILE_WRITE, &Body { cwd, write })
+            .await?
+            .result)
+    }
+
+    pub async fn create_file_entry(
+        &self,
+        cwd: &str,
+        parent_path: &str,
+        name: &str,
+        kind: EntryKind,
+    ) -> Result<String, PaseoError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            cwd: &'a str,
+            parent_path: &'a str,
+            name: &'a str,
+            kind: EntryKind,
+        }
+        self.require(DaemonFeature::FsEntryOps)?;
+        let body = Body {
+            cwd,
+            parent_path,
+            name,
+            kind,
+        };
+        let created = self
+            .call::<_, EntryCreated>(FILE_ENTRY_CREATE, &body)
+            .await?;
+        FILE_ENTRY_CREATE.accepted(created.success)?;
+        FILE_ENTRY_CREATE.required(created.path, "path")
+    }
+
+    pub async fn rename_file_entry(
+        &self,
+        cwd: &str,
+        path: &str,
+        name: &str,
+    ) -> Result<String, PaseoError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            cwd: &'a str,
+            path: &'a str,
+            name: &'a str,
+        }
+        self.require(DaemonFeature::FsEntryOps)?;
+        let rpc = Rpc::new("fs.entry.rename.request", "fs.entry.rename.response");
+        let renamed = self
+            .call::<_, EntryRenamed>(rpc, &Body { cwd, path, name })
+            .await?;
+        rpc.accepted(renamed.success)?;
+        rpc.required(renamed.renamed_path, "path")
+    }
+
+    pub async fn duplicate_file_entry(&self, cwd: &str, path: &str) -> Result<String, PaseoError> {
+        self.require(DaemonFeature::FsEntryDuplicate)?;
+        let rpc = Rpc::new("fs.entry.duplicate.request", "fs.entry.duplicate.response");
+        let duplicated = self
+            .call::<_, EntryDuplicated>(rpc, &PathTarget { cwd, path })
+            .await?;
+        rpc.accepted(duplicated.success)?;
+        rpc.required(duplicated.duplicated_path, "path")
+    }
+
+    pub async fn delete_file_entry(&self, cwd: &str, path: &str) -> Result<(), PaseoError> {
+        self.require(DaemonFeature::FsEntryOps)?;
+        let rpc = Rpc::new("fs.entry.delete.request", "fs.entry.delete.response");
+        let deleted = self
+            .call::<_, EntryDeleted>(rpc, &PathTarget { cwd, path })
+            .await?;
+        rpc.accepted(deleted.success)
+    }
+
+    pub async fn file_download_token(
+        &self,
+        cwd: &str,
+        path: &str,
+    ) -> Result<DownloadToken, PaseoError> {
+        let rpc = Rpc::new(
+            "file_download_token_request",
+            "file_download_token_response",
+        );
+        self.call_checked(rpc, &PathTarget { cwd, path }).await
+    }
+
+    pub async fn rename_project(
+        &self,
+        project_id: &str,
+        custom_name: Option<&str>,
+    ) -> Result<Option<String>, PaseoError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            project_id: &'a str,
+            custom_name: Option<&'a str>,
+        }
+        let rpc = Rpc::new("project.rename.request", "project.rename.response");
+        let renamed = self
+            .call::<_, ProjectRenamed>(
+                rpc,
+                &Body {
+                    project_id,
+                    custom_name,
+                },
+            )
+            .await?;
+        rpc.accepted(renamed.accepted)?;
+        Ok(renamed.custom_name)
+    }
+
+    pub async fn remove_project(&self, project_id: &str) -> Result<Vec<String>, PaseoError> {
+        self.require(DaemonFeature::ProjectRemove)?;
+        let rpc = Rpc::new("project.remove.request", "project.remove.response");
+        let removed = self
+            .call::<_, ProjectRemoved>(rpc, &ProjectTarget { project_id })
+            .await?;
+        rpc.accepted(removed.accepted)?;
+        Ok(removed.removed_workspace_ids)
+    }
+
+    pub async fn project_icon(&self, project_id: &str) -> Result<Option<ProjectIcon>, PaseoError> {
+        self.require(DaemonFeature::ProjectCustomIcon)?;
+        let rpc = Rpc::new("project.icon.get.request", "project.icon.get.response");
+        let fetched = self
+            .call::<_, ProjectIconFetched>(rpc, &ProjectTarget { project_id })
+            .await?;
+        fetched
+            .icon
+            .map(|icon| {
+                STANDARD
+                    .decode(icon.data)
+                    .map(|bytes| ProjectIcon::new(icon.mime_type, bytes))
+                    .map_err(|error| {
+                        PaseoError::decode(rpc.response, serde_json::Error::custom(error))
+                    })
+            })
+            .transpose()
+    }
+
+    pub async fn set_project_icon(
+        &self,
+        project_id: &str,
+        icon: Option<&[u8]>,
+    ) -> Result<(), PaseoError> {
+        #[derive(Serialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum Source {
+            Automatic,
+            Upload { data: String },
+        }
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            project_id: &'a str,
+            source: Source,
+        }
+        self.require(DaemonFeature::ProjectCustomIcon)?;
+        let source = match icon {
+            Some(bytes) => Source::Upload {
+                data: STANDARD.encode(bytes),
+            },
+            None => Source::Automatic,
+        };
+        let rpc = Rpc::new("project.icon.set.request", "project.icon.set.response");
+        let set = self
+            .call::<_, Accepted>(rpc, &Body { project_id, source })
+            .await?;
+        rpc.accepted(set.accepted)
+    }
+
+    pub async fn read_project_config(&self, repo_root: &str) -> Result<ProjectConfig, PaseoError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            repo_root: &'a str,
+        }
+        let rpc = Rpc::new(
+            "read_project_config_request",
+            "read_project_config_response",
+        );
+        Self::project_config(rpc, self.call(rpc, &Body { repo_root }).await?)
+    }
+
+    pub async fn write_project_config(
+        &self,
+        repo_root: &str,
+        config: &Map<String, Value>,
+        expected: Option<ProjectConfigRevision>,
+    ) -> Result<ProjectConfig, PaseoError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            repo_root: &'a str,
+            config: &'a Map<String, Value>,
+            expected_revision: Option<ProjectConfigRevision>,
+        }
+        let rpc = Rpc::new(
+            "write_project_config_request",
+            "write_project_config_response",
+        );
+        let body = Body {
+            repo_root,
+            config,
+            expected_revision: expected,
+        };
+        Self::project_config(rpc, self.call(rpc, &body).await?)
+    }
+
+    fn project_config(rpc: Rpc, reply: ProjectConfigReply) -> Result<ProjectConfig, PaseoError> {
+        match reply.error {
+            Some(error) => Err(PaseoError::request(
+                rpc.kind,
+                RequestFailure::ProjectConfig(error),
+            )),
+            None => Ok(reply.config),
+        }
+    }
+
+    pub async fn list_workspace_labels(&self) -> Result<LabelCatalogue, PaseoError> {
+        self.require(DaemonFeature::WorkspaceLabels)?;
+        self.call_checked(WORKSPACE_LABEL_LIST, &NoFields {}).await
+    }
+
+    pub async fn observe_workspace_labels(
+        &self,
+        since: Option<&LabelCursor>,
+    ) -> Result<Subscription<LabelCatalogue, LabelUpdate>, PaseoError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            subscribe: NoFields,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            sync: Option<&'a LabelCursor>,
+        }
+        self.require(DaemonFeature::WorkspaceLabels)?;
+        let body = Body {
+            subscribe: NoFields {},
+            sync: since,
+        };
+        self.observe(
+            WORKSPACE_LABEL_LIST,
+            &body,
+            |listed: Checked<LabelCatalogue>| listed.value,
+        )
+        .await
+    }
+
+    pub async fn set_workspace_label(
+        &self,
+        workspace_id: &str,
+        label: &WorkspaceLabel,
+        assigned: bool,
+    ) -> Result<LabelAssignment, PaseoError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            workspace_id: &'a str,
+            label: &'a WorkspaceLabel,
+            assigned: bool,
+        }
+        self.require(DaemonFeature::WorkspaceLabels)?;
+        let rpc = Rpc::new(
+            "workspace.label.assignment.set.request",
+            "workspace.label.assignment.set.response",
+        );
+        let body = Body {
+            workspace_id,
+            label,
+            assigned,
+        };
+        self.call_checked(rpc, &body).await
+    }
+
+    pub async fn edit_workspace_label(&self, edit: &LabelEdit) -> Result<EditedLabel, PaseoError> {
+        self.require(DaemonFeature::WorkspaceLabels)?;
+        let rpc = Rpc::new(
+            "workspace.label.update.request",
+            "workspace.label.update.response",
+        );
+        self.call_checked(rpc, edit).await
+    }
+
+    pub async fn delete_workspace_label(&self, name: &str) -> Result<u64, PaseoError> {
+        self.require(DaemonFeature::WorkspaceLabels)?;
+        let rpc = Rpc::new(
+            "workspace.label.delete.request",
+            "workspace.label.delete.response",
+        );
+        Ok(self
+            .call::<_, LabelCount>(rpc, &NameTarget { name })
+            .await?
+            .affected_workspace_count)
+    }
+
+    pub async fn inspect_label_deletion(&self, name: &str) -> Result<u64, PaseoError> {
+        self.require(DaemonFeature::WorkspaceLabels)?;
+        let rpc = Rpc::new(
+            "workspace.label.delete.inspect.request",
+            "workspace.label.delete.inspect.response",
+        );
+        Ok(self
+            .call::<_, LabelCount>(rpc, &NameTarget { name })
+            .await?
+            .affected_workspace_count)
+    }
+
+    pub async fn set_workspace_pinned(
+        &self,
+        workspace_id: &str,
+        pinned: bool,
+    ) -> Result<Option<String>, PaseoError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            workspace_id: &'a str,
+            pinned: bool,
+        }
+        self.require(DaemonFeature::WorkspacePinning)?;
+        let rpc = Rpc::new("workspace.pin.set.request", "workspace.pin.set.response");
+        let response = self
+            .call::<_, Pinned>(
+                rpc,
+                &Body {
+                    workspace_id,
+                    pinned,
+                },
+            )
+            .await?;
+        rpc.accepted(response.accepted)?;
+        Ok(response.pinned_at)
+    }
+
+    pub async fn mark_workspace_unread(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Option<String>, PaseoError> {
+        self.require(DaemonFeature::WorkspaceMarkUnread)?;
+        let rpc = Rpc::new(
+            "workspace.mark_unread.request",
+            "workspace.mark_unread.response",
+        );
+        let marked = self
+            .call::<_, MarkedUnread>(rpc, &WorkspaceTarget { workspace_id })
+            .await?;
+        rpc.accepted(marked.success)?;
+        Ok(marked.marked_agent_id)
+    }
+
+    pub async fn clear_workspace_attention(
+        &self,
+        workspace_ids: &[String],
+    ) -> Result<Vec<AttentionCleared>, PaseoError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            workspace_id: &'a [String],
+        }
+        let rpc = Rpc::new(
+            "workspace.clear_attention.request",
+            "workspace.clear_attention.response",
+        );
+        let cleared = self
+            .call::<_, AttentionClearedAll>(
+                rpc,
+                &Body {
+                    workspace_id: workspace_ids,
+                },
+            )
+            .await?;
+        rpc.accepted(cleared.success)?;
+        Ok(cleared.results)
+    }
+
+    pub async fn inspect_workspace_recovery(
+        &self,
+        workspace_id: &str,
+    ) -> Result<WorkspaceRecovery, PaseoError> {
+        self.require(DaemonFeature::WorkspaceRecovery)?;
+        let rpc = Rpc::new(
+            "workspace.recovery.inspect.request",
+            "workspace.recovery.inspect.response",
+        );
+        let inspected = self
+            .call::<_, RecoveryInspected>(rpc, &WorkspaceTarget { workspace_id })
+            .await?;
+        rpc.required(inspected.state, "recovery state")
+    }
+
+    pub async fn restore_workspace(&self, workspace_id: &str) -> Result<(), PaseoError> {
+        self.require(DaemonFeature::WorkspaceRecovery)?;
+        let rpc = Rpc::new(
+            "workspace.recovery.restore.request",
+            "workspace.recovery.restore.response",
+        );
+        let restored = self
+            .call::<_, Accepted>(rpc, &WorkspaceTarget { workspace_id })
+            .await?;
+        rpc.accepted(restored.accepted)
+    }
+
+    pub async fn observe_workspace_setup(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Subscription<Option<WorkspaceSetupSnapshot>, WorkspaceSetupProgress>, PaseoError>
+    {
+        self.require(DaemonFeature::WorkspaceSetupObservation)?;
+        let rpc = Rpc::new(
+            "workspace.setup.subscribe.request",
+            "workspace.setup.subscribe.response",
+        );
+        self.observe(
+            rpc,
+            &WorkspaceTarget { workspace_id },
+            |status: SetupStatus| status.snapshot,
+        )
+        .await
+    }
+
+    pub async fn search_github_repositories(
+        &self,
+        query: &str,
+        limit: Option<u32>,
+    ) -> Result<RepositorySearch, PaseoError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            query: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            limit: Option<u32>,
+        }
+        self.require(DaemonFeature::WorkspaceGithubRepositorySearch)?;
+        if let Some(limit) = limit {
+            check_limit("repository search limit", limit, FORGE_SEARCH_MAX_LIMIT)?;
+        }
+        let rpc = Rpc::new(
+            "workspace.github.search_repositories.request",
+            "workspace.github.search_repositories.response",
+        );
+        self.call(rpc, &Body { query, limit }).await
+    }
+
+    pub async fn close_items(
+        &self,
+        agent_ids: &[String],
+        terminal_ids: &[String],
+    ) -> Result<ClosedItems, PaseoError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            agent_ids: &'a [String],
+            terminal_ids: &'a [String],
+        }
+        let rpc = Rpc::new("close_items_request", "close_items_response");
+        self.call_checked(
+            rpc,
+            &Body {
+                agent_ids,
+                terminal_ids,
+            },
+        )
+        .await
+    }
+
+    pub async fn observe_creation(
+        &self,
+        kind: CreationKind,
+        idempotency_key: &str,
+    ) -> Result<Subscription<Option<CreationSnapshot>, CreationSnapshot>, PaseoError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            kind: CreationKind,
+            idempotency_key: &'a str,
+            subscribe: bool,
+        }
+        self.require(DaemonFeature::CreationLifecycle)?;
+        let rpc = Rpc::new("creation.subscribe.request", "creation.subscribe.response");
+        let body = Body {
+            kind,
+            idempotency_key,
+            subscribe: true,
+        };
+        self.observe(rpc, &body, |subscribed: CreationSubscribed| {
+            subscribed.snapshot
+        })
+        .await
+    }
+
+    pub async fn checkout_diff(
+        &self,
+        cwd: &str,
+        compare: &DiffCompare,
+    ) -> Result<CheckoutDiff, PaseoError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            cwd: &'a str,
+            compare: &'a DiffCompare,
+        }
+        self.require_diff_mode(compare)?;
+        let rpc = Rpc::new("checkout.diff.get.request", "checkout.diff.get.response");
+        self.call(rpc, &Body { cwd, compare }).await
+    }
+
+    fn require_diff_mode(&self, compare: &DiffCompare) -> Result<(), PaseoError> {
+        if compare.mode() == DiffMode::All {
+            self.require(DaemonFeature::CheckoutDiffAll)?;
+        }
+        Ok(())
+    }
+
+    pub async fn checkout_commit(
+        &self,
+        cwd: &str,
+        message: Option<&str>,
+        add_all: bool,
+    ) -> Result<(), PaseoError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            cwd: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            message: Option<&'a str>,
+            add_all: bool,
+        }
+        let rpc = Rpc::new("checkout_commit_request", "checkout_commit_response");
+        self.checkout_mutation(
+            rpc,
+            &Body {
+                cwd,
+                message,
+                add_all,
+            },
+        )
+        .await
+    }
+
+    pub async fn checkout_pull(&self, cwd: &str) -> Result<(), PaseoError> {
+        let rpc = Rpc::new("checkout_pull_request", "checkout_pull_response");
+        self.checkout_mutation(rpc, &CwdTarget { cwd }).await
+    }
+
+    pub async fn checkout_refresh(&self, cwd: &str) -> Result<(), PaseoError> {
+        self.require(DaemonFeature::CheckoutRefresh)?;
+        let rpc = Rpc::new("checkout.refresh.request", "checkout.refresh.response");
+        self.checkout_mutation(rpc, &CwdTarget { cwd }).await
+    }
+
+    pub async fn discard_changes(&self, cwd: &str, paths: &[String]) -> Result<(), PaseoError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            cwd: &'a str,
+            paths: &'a [String],
+        }
+        self.require(DaemonFeature::CheckoutDiscardChanges)?;
+        let rpc = Rpc::new(
+            "checkout.discard_changes.request",
+            "checkout.discard_changes.response",
+        );
+        self.checkout_mutation(rpc, &Body { cwd, paths }).await
+    }
+
+    pub async fn merge_pull_request(
+        &self,
+        cwd: &str,
+        method: MergeMethod,
+    ) -> Result<(), PaseoError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            cwd: &'a str,
+            merge_method: MergeMethod,
+        }
+        let rpc = Rpc::new("checkout_pr_merge_request", "checkout_pr_merge_response");
+        self.checkout_mutation(
+            rpc,
+            &Body {
+                cwd,
+                merge_method: method,
+            },
+        )
+        .await
+    }
+
+    pub async fn set_pull_request_auto_merge(
+        &self,
+        cwd: &str,
+        enabled: bool,
+        method: Option<MergeMethod>,
+    ) -> Result<(), PaseoError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            cwd: &'a str,
+            enabled: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            merge_method: Option<MergeMethod>,
+        }
+        let rpc = self.forge_rpc(
+            DaemonFeature::CheckoutForgeSetAutoMerge,
+            Rpc::new(
+                "checkout.forge.set_auto_merge.request",
+                "checkout.forge.set_auto_merge.response",
+            ),
+            DaemonFeature::CheckoutGithubSetAutoMerge,
+            Rpc::new(
+                "checkout.github.set_auto_merge.request",
+                "checkout.github.set_auto_merge.response",
+            ),
+        )?;
+        let body = Body {
+            cwd,
+            enabled,
+            merge_method: method,
+        };
+        self.checkout_mutation(rpc, &body).await
+    }
+
+    pub async fn check_details(
+        &self,
+        cwd: &str,
+        query: &CheckDetailsQuery,
+    ) -> Result<Option<CheckDetails>, PaseoError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            cwd: &'a str,
+            #[serde(flatten)]
+            query: &'a CheckDetailsQuery,
+        }
+        let rpc = self.forge_rpc(
+            DaemonFeature::ForgeCheckDetails,
+            Rpc::new(
+                "checkout.forge.get_check_details.request",
+                "checkout.forge.get_check_details.response",
+            ),
+            DaemonFeature::GithubCheckDetails,
+            Rpc::new(
+                "checkout.github.get_check_details.request",
+                "checkout.github.get_check_details.response",
+            ),
+        )?;
+        Ok(self
+            .call::<_, CheckoutResult<CheckDetailsFetched>>(rpc, &Body { cwd, query })
+            .await?
+            .value
+            .details)
+    }
+
+    fn forge_rpc(
+        &self,
+        forge: DaemonFeature,
+        forge_rpc: Rpc,
+        github: DaemonFeature,
+        github_rpc: Rpc,
+    ) -> Result<Rpc, PaseoError> {
+        let info = self.server_info();
+        if !info.supports(forge) && info.supports(github) {
+            return Ok(github_rpc);
+        }
+        self.require(forge)?;
+        Ok(forge_rpc)
+    }
+
+    pub async fn list_commits(&self, cwd: &str) -> Result<CommitList, PaseoError> {
+        self.require(DaemonFeature::CommitsList)?;
+        let rpc = Rpc::new(
+            "checkout.commits.list.request",
+            "checkout.commits.list.response",
+        );
+        Ok(self
+            .call::<_, CheckoutResult<CommitList>>(rpc, &CwdTarget { cwd })
+            .await?
+            .value)
+    }
+
+    pub async fn list_commit_page(
+        &self,
+        cwd: &str,
+        cursor: Option<&str>,
+        limit: u16,
+    ) -> Result<CommitPage, PaseoError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            cwd: &'a str,
+            cursor: Option<&'a str>,
+            limit: u16,
+        }
+        self.require(DaemonFeature::CommitsPagination)?;
+        let rpc = Rpc::new(
+            "checkout.commits.page.request",
+            "checkout.commits.page.response",
+        );
+        Ok(self
+            .call::<_, CheckoutResult<CommitPage>>(rpc, &Body { cwd, cursor, limit })
+            .await?
+            .value)
+    }
+
+    pub async fn commit_files(&self, cwd: &str, sha: &str) -> Result<Vec<CommitFile>, PaseoError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            cwd: &'a str,
+            sha: &'a str,
+        }
+        #[derive(Deserialize)]
+        struct FilesFetched {
+            files: Vec<CommitFile>,
+        }
+        self.require(DaemonFeature::CommitsPagination)?;
+        let rpc = Rpc::new(
+            "checkout.commits.files.request",
+            "checkout.commits.files.response",
+        );
+        Ok(self
+            .call::<_, CheckoutResult<FilesFetched>>(rpc, &Body { cwd, sha })
+            .await?
+            .value
+            .files)
+    }
+
+    pub async fn commit_file_diff(
+        &self,
+        cwd: &str,
+        sha: &str,
+        path: &str,
+    ) -> Result<Option<DiffFile>, PaseoError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            cwd: &'a str,
+            sha: &'a str,
+            path: &'a str,
+        }
+        self.require(DaemonFeature::CommitsList)?;
+        let rpc = Rpc::new(
+            "checkout.commits.file_diff.request",
+            "checkout.commits.file_diff.response",
+        );
+        Ok(self
+            .call::<_, CheckoutResult<FileDiffFetched>>(rpc, &Body { cwd, sha, path })
+            .await?
+            .value
+            .file)
+    }
+
+    pub async fn commit_before(
+        &self,
+        cwd: &str,
+        before: &str,
+    ) -> Result<Option<String>, PaseoError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            cwd: &'a str,
+            before: &'a str,
+        }
+        self.require(DaemonFeature::CheckoutCommitBefore)?;
+        let rpc = Rpc::new(
+            "checkout.commit_before.request",
+            "checkout.commit_before.response",
+        );
+        Ok(self
+            .call::<_, CheckoutResult<CommitFound>>(rpc, &Body { cwd, before })
+            .await?
+            .value
+            .commit)
+    }
+
+    pub async fn file_at_revision(
+        &self,
+        cwd: &str,
+        path: &str,
+        revision: &str,
+        max_bytes: Option<NonZeroU64>,
+    ) -> Result<String, PaseoError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            cwd: &'a str,
+            path: &'a str,
+            revision: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            max_bytes: Option<NonZeroU64>,
+        }
+        self.require(DaemonFeature::CheckoutFileAtRevision)?;
+        let rpc = Rpc::new(
+            "checkout.file_at_revision.request",
+            "checkout.file_at_revision.response",
+        );
+        let body = Body {
+            cwd,
+            path,
+            revision,
+            max_bytes,
+        };
+        let fetched = self
+            .call::<_, CheckoutResult<FileAtRevisionFetched>>(rpc, &body)
+            .await?
+            .value;
+        rpc.required(fetched.content, "content")
+    }
+
+    pub async fn switch_branch(
+        &self,
+        cwd: &str,
+        branch: &str,
+    ) -> Result<Option<BranchSource>, PaseoError> {
+        let rpc = Rpc::new(
+            "checkout_switch_branch_request",
+            "checkout_switch_branch_response",
+        );
+        let switched = self
+            .call_within::<_, CheckoutResult<BranchSwitched>>(
+                rpc,
+                &BranchTarget { cwd, branch },
+                Some(CHECKOUT_MUTATION_TIMEOUT),
+            )
+            .await?
+            .value;
+        rpc.accepted(switched.success)?;
+        Ok(switched.source)
+    }
+
+    pub async fn rename_branch(
+        &self,
+        cwd: &str,
+        branch: &str,
+    ) -> Result<Option<String>, PaseoError> {
+        let rpc = Rpc::new(
+            "checkout.rename_branch.request",
+            "checkout.rename_branch.response",
+        );
+        let renamed = self
+            .call::<_, CheckoutResult<BranchRenamed>>(rpc, &BranchTarget { cwd, branch })
+            .await?
+            .value;
+        rpc.accepted(renamed.success)?;
+        Ok(renamed.current_branch)
+    }
+
+    pub async fn validate_branch(
+        &self,
+        cwd: &str,
+        branch_name: &str,
+    ) -> Result<BranchValidation, PaseoError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            cwd: &'a str,
+            branch_name: &'a str,
+        }
+        let rpc = Rpc::new("validate_branch_request", "validate_branch_response");
+        self.call_checked(rpc, &Body { cwd, branch_name }).await
+    }
+
+    pub async fn stash_save(&self, cwd: &str, branch: Option<&str>) -> Result<(), PaseoError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            cwd: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            branch: Option<&'a str>,
+        }
+        let rpc = Rpc::new("stash_save_request", "stash_save_response");
+        self.checkout_mutation(rpc, &Body { cwd, branch }).await
+    }
+
+    pub async fn stash_pop(&self, cwd: &str, index: u32) -> Result<(), PaseoError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            cwd: &'a str,
+            stash_index: u32,
+        }
+        let rpc = Rpc::new("stash_pop_request", "stash_pop_response");
+        self.checkout_mutation(
+            rpc,
+            &Body {
+                cwd,
+                stash_index: index,
+            },
+        )
+        .await
+    }
+
+    pub async fn list_stashes(
+        &self,
+        cwd: &str,
+        paseo_only: bool,
+    ) -> Result<Vec<StashEntry>, PaseoError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            cwd: &'a str,
+            paseo_only: bool,
+        }
+        let rpc = Rpc::new("stash_list_request", "stash_list_response");
+        Ok(self
+            .call::<_, CheckoutResult<StashesListed>>(rpc, &Body { cwd, paseo_only })
+            .await?
+            .value
+            .entries)
+    }
+
+    pub async fn search_forge(
+        &self,
+        cwd: &str,
+        query: &str,
+        kinds: &[ForgeItemKind],
+        limit: Option<u32>,
+    ) -> Result<ForgeSearchResults, PaseoError> {
+        #[derive(Serialize)]
+        struct Body<'a, K> {
+            cwd: &'a str,
+            query: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            limit: Option<u32>,
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            kinds: &'a [K],
+        }
+        #[derive(Clone, Copy, Serialize)]
+        enum GithubKind {
+            #[serde(rename = "github-issue")]
+            Issue,
+            #[serde(rename = "github-pr")]
+            PullRequest,
+        }
+        if let Some(limit) = limit {
+            check_limit("forge search limit", limit, FORGE_SEARCH_MAX_LIMIT)?;
+        }
+        let (searched, unreported) = if self.server_info().supports(DaemonFeature::ForgeSearch) {
+            let rpc = Rpc::new("forge.search.request", "forge.search.response");
+            let body = Body {
+                cwd,
+                query,
+                limit,
+                kinds,
+            };
+            let searched = self.call::<_, ForgeSearched>(rpc, &body).await?;
+            (searched, ForgeAuthState::Unauthenticated)
+        } else {
+            let rpc = Rpc::new("github_search_request", "github_search_response");
+            let kinds = kinds
+                .iter()
+                .map(|kind| match kind {
+                    ForgeItemKind::ChangeRequest => GithubKind::PullRequest,
+                    ForgeItemKind::Issue => GithubKind::Issue,
+                })
+                .collect::<Vec<_>>();
+            let body = Body {
+                cwd,
+                query,
+                limit,
+                kinds: &kinds,
+            };
+            let searched = self.call::<_, ForgeSearched>(rpc, &body).await?;
+            let enabled = searched
+                .features_enabled
+                .or(searched.github_features_enabled)
+                .unwrap_or(true);
+            (searched, ForgeAuthState::unreported(enabled))
+        };
+        let auth_state = searched.auth_state.unwrap_or(unreported);
+        Ok(ForgeSearchResults::new(searched.items, auth_state))
+    }
+
+    pub async fn daemon_config(&self) -> Result<DaemonConfig, PaseoError> {
+        let rpc = Rpc::new("get_daemon_config_request", "get_daemon_config_response");
+        let fetched = self.call::<_, ConfigFetched>(rpc, &NoFields {}).await?;
+        rpc.required(fetched.config, "config")
+    }
+
+    pub async fn set_daemon_config(
+        &self,
+        patch: &DaemonConfigPatch,
+    ) -> Result<DaemonConfig, PaseoError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            config: &'a DaemonConfigPatch,
+        }
+        if !patch.removed_providers().is_empty() {
+            self.require(DaemonFeature::ProviderRemoval)?;
+        }
+        if patch.agent_profiles().is_some() {
+            self.require(DaemonFeature::AgentProfiles)?;
+        }
+        let rpc = Rpc::new("set_daemon_config_request", "set_daemon_config_response");
+        let set = self
+            .call::<_, ConfigFetched>(rpc, &Body { config: patch })
+            .await?;
+        rpc.required(set.config, "config")
+    }
+
+    pub async fn reload_daemon_config(&self) -> Result<ConfigReload, PaseoError> {
+        self.require(DaemonFeature::DaemonConfigReload)?;
+        let rpc = Rpc::new(
+            "daemon.config.reload.request",
+            "daemon.config.reload.response",
+        );
+        self.call_checked(rpc, &NoFields {}).await
+    }
+
+    pub async fn pairing_offer(&self) -> Result<PairingOffer, PaseoError> {
+        let rpc = Rpc::new(
+            "daemon.get_pairing_offer.request",
+            "daemon.get_pairing_offer.response",
+        );
+        self.call_checked(rpc, &NoFields {}).await
+    }
+
+    pub async fn daemon_diagnostics(&self) -> Result<String, PaseoError> {
+        self.require(DaemonFeature::DaemonDiagnostics)?;
+        let rpc = Rpc::new("diagnostics.request", "diagnostics.response");
+        let diagnosed = self.call::<_, Diagnosed>(rpc, &NoFields {}).await?;
+        rpc.required(diagnosed.diagnostic, "diagnostic")
+    }
+
+    pub fn update_daemon(&self) -> Result<DaemonUpdate, PaseoError> {
+        self.require(DaemonFeature::DaemonSelfUpdate)?;
+        let (phases_tx, phases) = flume::unbounded();
+        let pending = self.inner.submit(
+            &Request {
+                kind: DAEMON_UPDATE.kind,
+                response_type: DAEMON_UPDATE.response,
+                body: &NoFields {},
+            },
+            None,
+            Some(Tracking::Progress {
+                kind: DAEMON_UPDATE_PROGRESS,
+                deliver: Inner::deliver(phases_tx),
+            }),
+        )?;
+        Ok(DaemonUpdate { phases, pending })
+    }
+
+    pub fn register_push_token(&self, token: &str) -> Result<(), PaseoError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            token: &'a str,
+        }
+        let text = session_message("register_push_token", None, &Body { token })?;
+        self.inner.send(Frame::Text(text))
+    }
+
+    pub async fn unregister_push_token(&self, token: &str) -> Result<(), PaseoError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            token: &'a str,
+        }
+        self.require(DaemonFeature::PushTokenRevocation)?;
+        let rpc = Rpc::new("push.unregister.request", "push.unregister.response");
+        self.call::<_, Acknowledged>(rpc, &Body { token }).await?;
+        Ok(())
+    }
+
+    pub async fn shutdown_server(&self) -> Result<(), PaseoError> {
+        let rpc = Rpc::new("shutdown_server_request", "status");
+        let response = self.call::<_, ServerStatusReply>(rpc, &NoFields {}).await?;
+        response.confirm(rpc, ServerStatus::ShutdownRequested)
+    }
+
+    pub async fn start_provider_setup(
+        &self,
+        provider: &str,
+        action: ProviderSetupAction,
+        workspace_id: &str,
+    ) -> Result<ProviderSetup, PaseoError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            provider: &'a str,
+            action: ProviderSetupAction,
+            workspace_id: &'a str,
+        }
+        self.require(DaemonFeature::ProviderSetup)?;
+        let rpc = Rpc::new("provider.setup.request", "provider.setup.response");
+        self.call_within(
+            rpc,
+            &Body {
+                provider,
+                action,
+                workspace_id,
+            },
+            Some(PROVIDER_CATALOGUE_TIMEOUT),
+        )
+        .await
+    }
+
+    pub async fn provider_installations(
+        &self,
+        provider: &str,
+    ) -> Result<ProviderInstallations, PaseoError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            provider: &'a str,
+        }
+        self.require(DaemonFeature::ProviderInstallations)?;
+        let rpc = Rpc::new(
+            "provider.installations.request",
+            "provider.installations.response",
+        );
+        self.call_within(rpc, &Body { provider }, Some(PROVIDER_CATALOGUE_TIMEOUT))
+            .await
+    }
+
+    pub async fn provider_diagnostic(&self, provider: &str) -> Result<String, PaseoError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            provider: &'a str,
+        }
+        let rpc = Rpc::new(
+            "provider_diagnostic_request",
+            "provider_diagnostic_response",
+        );
+        let diagnosed = self
+            .call_within::<_, Diagnosed>(rpc, &Body { provider }, Some(PROVIDER_CATALOGUE_TIMEOUT))
+            .await?;
+        rpc.required(diagnosed.diagnostic, "diagnostic")
+    }
+
+    pub fn usage_reports(&self, query: &UsageReportsQuery) -> Result<UsageReportFetch, PaseoError> {
+        self.require(DaemonFeature::UsageSources)?;
+        let (reports_tx, reports) = flume::unbounded();
+        let pending = self.inner.submit(
+            &Request {
+                kind: USAGE_REPORTS.kind,
+                response_type: USAGE_REPORTS.response,
+                body: query,
+            },
+            None,
+            Some(Tracking::Progress {
+                kind: USAGE_REPORT_UPDATE,
+                deliver: Inner::deliver(reports_tx),
+            }),
+        )?;
+        Ok(UsageReportFetch { reports, pending })
+    }
+
+    pub async fn recent_provider_sessions(
+        &self,
+        query: &RecentSessionsQuery,
+    ) -> Result<RecentProviderSessions, PaseoError> {
+        if query.query().is_some() {
+            self.require(DaemonFeature::ImportSessionSearch)?;
+        }
+        let rpc = Rpc::new(
+            "fetch_recent_provider_sessions_request",
+            "fetch_recent_provider_sessions_response",
+        );
+        self.call_within(rpc, query, Some(PROVIDER_CATALOGUE_TIMEOUT))
+            .await
+    }
+
+    pub async fn search_timeline(
+        &self,
+        agent_id: &str,
+        query: &str,
+        cursor: Option<u64>,
+    ) -> Result<TimelineSearch, PaseoError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            agent_id: &'a str,
+            query: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            cursor: Option<u64>,
+        }
+        self.require(DaemonFeature::AgentHistorySearch)?;
+        let rpc = Rpc::new(
+            "agent.timeline.search.request",
+            "agent.timeline.search.response",
+        );
+        let body = Body {
+            agent_id,
+            query,
+            cursor,
+        };
+        self.call_checked(rpc, &body).await
+    }
+
+    pub async fn skills_status(&self) -> Result<SkillsStatus, PaseoError> {
+        self.require(DaemonFeature::SkillManagement)?;
+        let rpc = Rpc::new(
+            "agent.skills.get_status.request",
+            "agent.skills.get_status.response",
+        );
+        self.call_checked(rpc, &NoFields {}).await
+    }
+
+    pub async fn reconcile_skills(&self) -> Result<SkillsStatus, PaseoError> {
+        self.require(DaemonFeature::SkillManagement)?;
+        let rpc = Rpc::new(
+            "agent.skills.reconcile.request",
+            "agent.skills.reconcile.response",
+        );
+        self.call_checked(rpc, &NoFields {}).await
+    }
+
+    pub async fn uninstall_skills(&self) -> Result<SkillsStatus, PaseoError> {
+        self.require(DaemonFeature::SkillManagement)?;
+        let rpc = Rpc::new(
+            "agent.skills.uninstall.request",
+            "agent.skills.uninstall.response",
+        );
+        self.call_checked(rpc, &NoFields {}).await
+    }
+
+    pub async fn save_skill_selection(
+        &self,
+        selection: &SkillSelection,
+        confirmed_removals: &[String],
+    ) -> Result<SavedSkills, PaseoError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            selection: &'a SkillSelection,
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            confirmed_removals: &'a [String],
+        }
+        self.require(DaemonFeature::SkillManagement)?;
+        let rpc = Rpc::new(
+            "agent.skills.save_selection.request",
+            "agent.skills.save_selection.response",
+        );
+        let body = Body {
+            selection,
+            confirmed_removals,
+        };
+        self.call_checked(rpc, &body).await
+    }
+
+    pub async fn import_legacy_skill_selection(
+        &self,
+        selection: &SkillSelection,
+    ) -> Result<ImportedSkills, PaseoError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            selection: &'a SkillSelection,
+        }
+        self.require(DaemonFeature::SkillManagement)?;
+        let rpc = Rpc::new(
+            "agent.skills.import_legacy_selection.request",
+            "agent.skills.import_legacy_selection.response",
+        );
+        self.call_checked(rpc, &Body { selection }).await
+    }
+
+    pub async fn inspect_schedule(&self, schedule_id: &str) -> Result<ScheduleDetail, PaseoError> {
+        let rpc = Rpc::new("schedule/inspect", "schedule/inspect/response");
+        let inspected = self
+            .call::<_, ScheduleInspected>(rpc, &ScheduleIdTarget { schedule_id })
+            .await?;
+        rpc.required(inspected.schedule, "schedule")
+    }
+
+    pub async fn update_schedule(
+        &self,
+        schedule_id: &str,
+        update: &ScheduleUpdate,
+    ) -> Result<ScheduleDetail, PaseoError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            schedule_id: &'a str,
+            #[serde(flatten)]
+            update: &'a ScheduleUpdate,
+        }
+        let rpc = Rpc::new("schedule/update", "schedule/update/response");
+        let updated = self
+            .call::<_, ScheduleInspected>(
+                rpc,
+                &Body {
+                    schedule_id,
+                    update,
+                },
+            )
+            .await?;
+        rpc.required(updated.schedule, "schedule")
+    }
+
+    pub async fn list_hosts(&self) -> Result<HostDirectory, PaseoError> {
+        self.require(DaemonFeature::ConnectedHosts)?;
+        Ok(self
+            .call::<_, HostsListed>(HOSTS_LIST, &NoFields {})
+            .await?
+            .directory)
+    }
+
+    pub async fn observe_hosts(
+        &self,
+    ) -> Result<Subscription<HostDirectory, HostDirectory>, PaseoError> {
+        #[derive(Serialize)]
+        struct Body {
+            observe: bool,
+        }
+        self.require(DaemonFeature::ConnectedHosts)?;
+        self.observe(
+            HOSTS_LIST,
+            &Body { observe: true },
+            |listed: HostsListed| listed.directory,
+        )
+        .await
+    }
+
+    pub async fn add_host(&self, host: &HostAdd) -> Result<HostSummary, PaseoError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            input: &'a HostAdd,
+        }
+        self.require(DaemonFeature::ConnectedHosts)?;
+        let rpc = Rpc::new("hosts.add.request", "hosts.add.response");
+        let saved = self
+            .call::<_, HostSaved>(rpc, &Body { input: host })
+            .await?;
+        rpc.required(saved.host, "host")
+    }
+
+    pub async fn update_host(
+        &self,
+        registration_id: &str,
+        update: &HostUpdate,
+    ) -> Result<HostSummary, PaseoError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            registration_id: &'a str,
+            patch: &'a HostUpdate,
+        }
+        self.require(DaemonFeature::ConnectedHosts)?;
+        let rpc = Rpc::new("hosts.update.request", "hosts.update.response");
+        let body = Body {
+            registration_id,
+            patch: update,
+        };
+        let saved = self.call::<_, HostSaved>(rpc, &body).await?;
+        rpc.required(saved.host, "host")
+    }
+
+    pub async fn remove_host(&self, registration_id: &str) -> Result<(), PaseoError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            registration_id: &'a str,
+        }
+        self.require(DaemonFeature::ConnectedHosts)?;
+        let rpc = Rpc::new("hosts.remove.request", "hosts.remove.response");
+        self.call::<_, Acknowledged>(rpc, &Body { registration_id })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn connect_host(
+        &self,
+        server_id: &str,
+        options: &ConnectOptions,
+    ) -> Result<PaseoClient, PaseoError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            server_id: &'a str,
+            scope_id: &'a str,
+        }
+        self.require(DaemonFeature::ConnectedHosts)?;
+        let rpc = Rpc::new("hosts.route.open.request", "hosts.route.open.response");
+        let (events, receiver) = flume::unbounded();
+        let (route_tx, route) = oneshot::channel();
+        let request = Request {
+            kind: rpc.kind,
+            response_type: rpc.response,
+            body: &Body {
+                server_id,
+                scope_id: options.client_id(),
+            },
+        };
+        let connect = async {
+            let registration = Inner::host_route_registration(events, rpc.response, route_tx);
+            self.inner
+                .submit(&request, Some(registration), None)?
+                .wait(None)
+                .await?;
+            let route_id = route
+                .await
+                .expect("an opened route reports its id before the reply");
+            let socket = Socket::Routed(RoutedSocket::new(route_id, &self.inner, receiver));
+            PaseoClient::handshake(Connection::plain(socket), None, options).await
+        };
+        timed(connect, CONNECT_TIMEOUT)
+            .await
+            .ok_or(PaseoError::Timeout {
+                request_type: rpc.kind,
+            })?
     }
 }
 

@@ -1,6 +1,8 @@
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use paseo_client::{ConnectTarget, DEFAULT_SSH_DAEMON_PORT, Endpoint, EndpointError};
+#[cfg(feature = "ssh")]
+use paseo_client::DEFAULT_SSH_DAEMON_PORT;
+use paseo_client::{ConnectTarget, Endpoint, EndpointError, SecurityMode};
 
 fn parse(input: &str) -> ConnectTarget {
     input.parse::<ConnectTarget>().expect("endpoint parses")
@@ -68,6 +70,7 @@ fn unix_socket_path_is_kept_verbatim() {
 }
 
 #[test]
+#[cfg(feature = "ssh")]
 fn ssh_uri_matches_the_cli_transport_shape() {
     let Endpoint::Ssh(ssh) = parse("ssh://dev%40ops@build-box:2222?daemonPort=7000")
         .endpoint()
@@ -84,9 +87,11 @@ fn ssh_uri_matches_the_cli_transport_shape() {
     };
     assert_eq!(ssh.daemon_port(), DEFAULT_SSH_DAEMON_PORT);
     assert_eq!(ssh.ssh_port(), None);
+    assert!(!parse("ssh://me@127.0.0.1").endpoint().is_local());
 }
 
 #[test]
+#[cfg(feature = "ssh")]
 fn ssh_uri_rejects_parts_the_tunnel_cannot_honour() {
     assert!(matches!(
         reject("ssh://user:pw@host"),
@@ -135,6 +140,27 @@ fn relay_uri_and_offer_fragment_produce_the_same_offer() {
 }
 
 #[test]
+fn relay_security_pin_survives_both_offer_forms() {
+    let offer_json = r#"{"v":2,"serverId":"srv_1","daemonPublicKeyB64":"a2V5","relay":{"endpoint":"relay.example:443","useTls":true},"minimumSecurityMode":"protected"}"#;
+    let from_fragment = parse(&format!(
+        "https://app.paseo.sh/#offer={}",
+        URL_SAFE_NO_PAD.encode(offer_json)
+    ));
+    let from_uri = parse("relay://relay.example:443/srv_1?key=a2V5&ssl=true&security=protected");
+    let (Endpoint::Relay(fragment), Endpoint::Relay(uri)) =
+        (from_fragment.endpoint(), from_uri.endpoint())
+    else {
+        panic!("expected relay endpoints");
+    };
+    assert_eq!(fragment, uri);
+    assert_eq!(uri.minimum_security_mode(), Some(SecurityMode::Protected));
+    assert!(matches!(
+        reject("relay://relay.example:443/srv_1?key=a2V5&security=legacy"),
+        EndpointError::UnsupportedPart { .. }
+    ));
+}
+
+#[test]
 fn relay_uri_requires_server_and_key() {
     assert!(matches!(
         reject("relay://relay.example:443/?key=a2V5"),
@@ -180,6 +206,7 @@ fn bare_paths_and_ports_follow_the_cli_target_rules() {
 }
 
 #[test]
+#[cfg(feature = "ssh")]
 fn ssh_host_is_validated_on_its_own() {
     assert!(matches!(
         reject("ssh://user@-badhost"),
@@ -208,9 +235,17 @@ fn only_loopback_and_unix_endpoints_are_local() {
     for remote in [
         "10.0.0.2:6767",
         "build.example:6767",
-        "ssh://me@127.0.0.1",
         "relay://127.0.0.1:443/srv?key=a2V5",
     ] {
         assert!(!parse(remote).endpoint().is_local(), "{remote}");
     }
+}
+
+#[test]
+#[cfg(not(feature = "ssh"))]
+fn ssh_uri_without_the_ssh_feature_is_rejected() {
+    assert!(matches!(
+        reject("ssh://me@build-box"),
+        EndpointError::SshUnsupported { input } if input == "ssh://me@build-box"
+    ));
 }

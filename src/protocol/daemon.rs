@@ -1,26 +1,124 @@
 use std::collections::HashMap;
 
-use serde::{Deserialize, Deserializer};
-use serde_json::Value;
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::{Map, Value};
 
 use crate::protocol::number::WireNumber;
 use crate::protocol::providers::ProviderAvailability;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DaemonFeature {
+    AgentForkFromPrompt,
+    AgentHistorySearch,
+    AgentOrganization,
+    AgentProfiles,
+    AgentReview,
+    AgentReviewRemovedLines,
+    ApnsPush,
+    CheckoutCommitBefore,
+    CheckoutDiffAll,
+    CheckoutDiffCommitBase,
+    CheckoutDiscardChanges,
+    CheckoutFileAtRevision,
+    CheckoutForgeSetAutoMerge,
+    CheckoutGithubSetAutoMerge,
+    CheckoutRefresh,
+    CommitsList,
+    CommitsPagination,
+    ConnectedHosts,
+    CreationLifecycle,
+    DaemonConfigReload,
+    DaemonDiagnostics,
+    DaemonSelfUpdate,
     DaemonStatusRpc,
     ExplicitEventSubscriptions,
+    FileByteWrites,
+    ForgeCheckDetails,
+    ForgeProviders,
+    ForgeSearch,
+    FsEntryDuplicate,
+    FsEntryOps,
+    GithubCheckDetails,
+    ImportSessionSearch,
     OwnedSubscriptions,
+    ProjectCustomIcon,
+    ProjectRemove,
+    ProviderInstallations,
+    ProviderRemoval,
+    ProviderSetup,
+    ProviderUsageList,
+    PushTokenRevocation,
+    RelayProtectedSecurity,
+    SkillManagement,
+    StreamChannelUnixSockets,
     StreamChannels,
+    UsageSources,
+    WorkspaceFileEditing,
+    WorkspaceGithubRepositorySearch,
+    WorkspaceLabels,
+    WorkspaceMarkUnread,
+    WorkspacePinning,
+    WorkspaceRecovery,
+    WorkspaceSetupObservation,
+    WorkspaceSetupRun,
 }
 
 impl DaemonFeature {
     pub fn wire_name(self) -> &'static str {
         match self {
+            DaemonFeature::AgentForkFromPrompt => "agentForkFromPrompt",
+            DaemonFeature::AgentHistorySearch => "agentHistorySearch",
+            DaemonFeature::AgentOrganization => "agentOrganization",
+            DaemonFeature::AgentProfiles => "agentProfiles",
+            DaemonFeature::AgentReview => "agentReview",
+            DaemonFeature::AgentReviewRemovedLines => "agentReviewRemovedLines",
+            DaemonFeature::ApnsPush => "apnsPush",
+            DaemonFeature::CheckoutCommitBefore => "checkoutCommitBefore",
+            DaemonFeature::CheckoutDiffAll => "checkoutDiffAll",
+            DaemonFeature::CheckoutDiffCommitBase => "checkoutDiffCommitBase",
+            DaemonFeature::CheckoutDiscardChanges => "checkoutDiscardChanges",
+            DaemonFeature::CheckoutFileAtRevision => "checkoutFileAtRevision",
+            DaemonFeature::CheckoutForgeSetAutoMerge => "checkoutForgeSetAutoMerge",
+            DaemonFeature::CheckoutGithubSetAutoMerge => "checkoutGithubSetAutoMerge",
+            DaemonFeature::CheckoutRefresh => "checkoutRefresh",
+            DaemonFeature::CommitsList => "commitsList",
+            DaemonFeature::CommitsPagination => "commitsPagination",
+            DaemonFeature::ConnectedHosts => "connectedHosts",
+            DaemonFeature::CreationLifecycle => "creationLifecycle",
+            DaemonFeature::DaemonConfigReload => "daemonConfigReload",
+            DaemonFeature::DaemonDiagnostics => "daemonDiagnostics",
+            DaemonFeature::DaemonSelfUpdate => "daemonSelfUpdate",
             DaemonFeature::DaemonStatusRpc => "daemonStatusRpc",
             DaemonFeature::ExplicitEventSubscriptions => "explicitEventSubscriptions",
+            DaemonFeature::FileByteWrites => "fileByteWrites",
+            DaemonFeature::ForgeCheckDetails => "forgeCheckDetails",
+            DaemonFeature::ForgeProviders => "forgeProviders",
+            DaemonFeature::ForgeSearch => "forgeSearch",
+            DaemonFeature::FsEntryDuplicate => "fsEntryDuplicate",
+            DaemonFeature::FsEntryOps => "fsEntryOps",
+            DaemonFeature::GithubCheckDetails => "githubCheckDetails",
+            DaemonFeature::ImportSessionSearch => "importSessionSearch",
             DaemonFeature::OwnedSubscriptions => "ownedSubscriptions",
+            DaemonFeature::ProjectCustomIcon => "projectCustomIcon",
+            DaemonFeature::ProjectRemove => "projectRemove",
+            DaemonFeature::ProviderInstallations => "providerInstallations",
+            DaemonFeature::ProviderRemoval => "providerRemoval",
+            DaemonFeature::ProviderSetup => "providerSetup",
+            DaemonFeature::ProviderUsageList => "providerUsageList",
+            DaemonFeature::PushTokenRevocation => "pushTokenRevocation",
+            DaemonFeature::RelayProtectedSecurity => "relayProtectedSecurity",
+            DaemonFeature::SkillManagement => "skillManagement",
+            DaemonFeature::StreamChannelUnixSockets => "streamChannelUnixSockets",
             DaemonFeature::StreamChannels => "streamChannels",
+            DaemonFeature::UsageSources => "usageSources",
+            DaemonFeature::WorkspaceFileEditing => "workspaceFileEditing",
+            DaemonFeature::WorkspaceGithubRepositorySearch => "workspaceGithubRepositorySearch",
+            DaemonFeature::WorkspaceLabels => "workspaceLabels",
+            DaemonFeature::WorkspaceMarkUnread => "workspaceMarkUnread",
+            DaemonFeature::WorkspacePinning => "workspacePinning",
+            DaemonFeature::WorkspaceRecovery => "workspaceRecovery",
+            DaemonFeature::WorkspaceSetupObservation => "workspaceSetupObservation",
+            DaemonFeature::WorkspaceSetupRun => "workspaceSetupRun",
         }
     }
 }
@@ -179,5 +277,189 @@ impl UploadedFile {
 
     pub fn path(&self) -> &str {
         &self.path
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceType {
+    Mobile,
+    Web,
+}
+
+/// What the daemon needs to pick the one client that notifies about an agent: whether the user is
+/// present, whether the app is visible, and which agent it shows.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientHeartbeat {
+    device_type: DeviceType,
+    focused_agent_id: Option<String>,
+    focused_terminal_id: Option<String>,
+    last_activity_at: String,
+    app_visible: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    app_visibility_changed_at: Option<String>,
+}
+
+impl ClientHeartbeat {
+    pub fn new(
+        device_type: DeviceType,
+        focused_agent_id: Option<String>,
+        last_activity_at: String,
+        app_visible: bool,
+    ) -> ClientHeartbeat {
+        ClientHeartbeat {
+            device_type,
+            focused_agent_id,
+            focused_terminal_id: None,
+            last_activity_at,
+            app_visible,
+            app_visibility_changed_at: None,
+        }
+    }
+
+    pub fn device_type(&self) -> DeviceType {
+        self.device_type
+    }
+
+    pub fn focused_agent_id(&self) -> Option<&str> {
+        self.focused_agent_id.as_deref()
+    }
+
+    pub fn focused_terminal_id(&self) -> Option<&str> {
+        self.focused_terminal_id.as_deref()
+    }
+
+    pub fn set_focused_terminal_id(&mut self, focused_terminal_id: impl Into<String>) {
+        self.focused_terminal_id = Some(focused_terminal_id.into());
+    }
+
+    pub fn with_focused_terminal_id(
+        mut self,
+        focused_terminal_id: impl Into<String>,
+    ) -> ClientHeartbeat {
+        self.set_focused_terminal_id(focused_terminal_id);
+        self
+    }
+
+    pub fn last_activity_at(&self) -> &str {
+        &self.last_activity_at
+    }
+
+    pub fn app_visible(&self) -> bool {
+        self.app_visible
+    }
+
+    pub fn app_visibility_changed_at(&self) -> Option<&str> {
+        self.app_visibility_changed_at.as_deref()
+    }
+
+    pub fn set_app_visibility_changed_at(&mut self, changed_at: impl Into<String>) {
+        self.app_visibility_changed_at = Some(changed_at.into());
+    }
+
+    pub fn with_app_visibility_changed_at(
+        mut self,
+        changed_at: impl Into<String>,
+    ) -> ClientHeartbeat {
+        self.set_app_visibility_changed_at(changed_at);
+        self
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PairingOffer {
+    url: String,
+    #[serde(default)]
+    qr: Option<String>,
+    relay_enabled: bool,
+}
+
+impl PairingOffer {
+    pub fn url(&self) -> Option<&str> {
+        Some(self.url.as_str()).filter(|url| !url.is_empty())
+    }
+
+    pub fn qr(&self) -> Option<&str> {
+        self.qr.as_deref()
+    }
+
+    pub fn relay_enabled(&self) -> bool {
+        self.relay_enabled
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonUpdatePhase {
+    Complete,
+    Downloading,
+    Installing,
+    Starting,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonUpdated {
+    previous_version: Option<String>,
+    new_version: Option<String>,
+}
+
+impl DaemonUpdated {
+    pub fn previous_version(&self) -> Option<&str> {
+        self.previous_version.as_deref()
+    }
+
+    pub fn new_version(&self) -> Option<&str> {
+        self.new_version.as_deref()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityKind {
+    Assistant,
+    Error,
+    System,
+    ToolCall,
+    ToolResult,
+    Transcript,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct ActivityLogEntry {
+    id: String,
+    timestamp: String,
+    #[serde(rename = "type")]
+    kind: ActivityKind,
+    content: String,
+    #[serde(default)]
+    metadata: Map<String, Value>,
+}
+
+impl ActivityLogEntry {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn timestamp(&self) -> &str {
+        &self.timestamp
+    }
+
+    pub fn kind(&self) -> ActivityKind {
+        self.kind
+    }
+
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+
+    pub fn metadata(&self) -> &Map<String, Value> {
+        &self.metadata
     }
 }

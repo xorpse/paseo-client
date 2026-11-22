@@ -1,8 +1,9 @@
+#[cfg(feature = "ssh")]
 use std::collections::VecDeque;
 use std::io;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -10,26 +11,39 @@ use async_io::Timer;
 use async_net::TcpStream;
 #[cfg(unix)]
 use async_net::unix::UnixStream;
+#[cfg(feature = "ssh")]
 use async_process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
-use async_tungstenite::tungstenite::Message;
 use async_tungstenite::tungstenite::client::IntoClientRequest;
-use async_tungstenite::{WebSocketStream, client_async};
+use async_tungstenite::tungstenite::protocol::WebSocketConfig;
+use async_tungstenite::tungstenite::{self, Message};
+use async_tungstenite::{WebSocketStream, client_async_with_config};
+use flume::r#async::RecvStream;
 use futures::io::{AsyncRead, AsyncWrite};
-use futures::{StreamExt, future};
+use futures::{Sink, SinkExt, Stream as FrameStream, StreamExt, future};
 use futures_rustls::TlsConnector;
 use futures_rustls::client::TlsStream;
 use futures_rustls::pki_types::ServerName;
 use futures_rustls::rustls::ClientConfig;
+#[cfg(feature = "ssh")]
 use parking_lot::Mutex;
+use serde::Serialize;
 
-use crate::e2ee::{Channel, Ready};
+use crate::binary_frames::HostRouteFrame;
+use crate::client::Inner;
+use crate::e2ee::{Cipher, Handshake, SecurityMode, is_ready};
 use crate::endpoint::{Endpoint, HostPort, SshTarget};
-use crate::error::{EndpointError, PaseoError, ProtocolViolation, SshTunnelClosed};
+use crate::envelope::session_message;
+#[cfg(feature = "ssh")]
+use crate::error::SshTunnelClosed;
+use crate::error::{EndpointError, HostRouteClosed, PaseoError, ProtocolViolation};
 
 const HANDSHAKE_RETRY: Duration = Duration::from_secs(1);
+const MAX_MESSAGE_BYTES: usize = 100 << 20;
+#[cfg(feature = "ssh")]
 const SSH_STDERR_LIMIT: usize = 8192;
 
 pub(crate) enum Stream {
+    #[cfg(feature = "ssh")]
     Ssh(SshStream),
     Tcp(TcpStream),
     Tls(Box<TlsStream<TcpStream>>),
@@ -37,6 +51,7 @@ pub(crate) enum Stream {
     Unix(UnixStream),
 }
 
+#[cfg(feature = "ssh")]
 pub(crate) struct SshStream {
     _child: Child,
     stdin: ChildStdin,
@@ -45,12 +60,14 @@ pub(crate) struct SshStream {
     diagnostics: Arc<Mutex<SshDiagnostics>>,
 }
 
+#[cfg(feature = "ssh")]
 #[derive(Default)]
 struct SshDiagnostics {
     tail: VecDeque<u8>,
     line: Vec<u8>,
 }
 
+#[cfg(feature = "ssh")]
 impl SshDiagnostics {
     fn record(&mut self, bytes: &[u8]) {
         self.tail.extend(bytes);
@@ -83,6 +100,7 @@ impl AsyncRead for Stream {
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
         match self.get_mut() {
+            #[cfg(feature = "ssh")]
             Stream::Ssh(stream) => stream.poll_read(cx, buf),
             Stream::Tcp(stream) => Pin::new(stream).poll_read(cx, buf),
             Stream::Tls(stream) => Pin::new(stream.as_mut()).poll_read(cx, buf),
@@ -99,6 +117,7 @@ impl AsyncWrite for Stream {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         match self.get_mut() {
+            #[cfg(feature = "ssh")]
             Stream::Ssh(stream) => Pin::new(&mut stream.stdin).poll_write(cx, buf),
             Stream::Tcp(stream) => Pin::new(stream).poll_write(cx, buf),
             Stream::Tls(stream) => Pin::new(stream.as_mut()).poll_write(cx, buf),
@@ -109,6 +128,7 @@ impl AsyncWrite for Stream {
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
+            #[cfg(feature = "ssh")]
             Stream::Ssh(stream) => Pin::new(&mut stream.stdin).poll_flush(cx),
             Stream::Tcp(stream) => Pin::new(stream).poll_flush(cx),
             Stream::Tls(stream) => Pin::new(stream.as_mut()).poll_flush(cx),
@@ -119,6 +139,7 @@ impl AsyncWrite for Stream {
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
+            #[cfg(feature = "ssh")]
             Stream::Ssh(stream) => Pin::new(&mut stream.stdin).poll_close(cx),
             Stream::Tcp(stream) => Pin::new(stream).poll_close(cx),
             Stream::Tls(stream) => Pin::new(stream.as_mut()).poll_close(cx),
@@ -128,6 +149,7 @@ impl AsyncWrite for Stream {
     }
 }
 
+#[cfg(feature = "ssh")]
 impl SshStream {
     fn spawn(target: &SshTarget) -> Result<SshStream, PaseoError> {
         let mut child = Command::new("ssh")
@@ -182,7 +204,150 @@ impl SshStream {
     }
 }
 
-pub(crate) type Socket = WebSocketStream<Stream>;
+pub(crate) enum Socket {
+    Direct(Box<WebSocketStream<Stream>>),
+    Routed(RoutedSocket),
+}
+
+pub(crate) enum RouteEvent {
+    Closed(HostRouteClosed),
+    Frame(Frame),
+}
+
+pub(crate) struct RoutedSocket {
+    route_id: String,
+    origin: Weak<Inner>,
+    events: RecvStream<'static, RouteEvent>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RouteFrameRequest<'a> {
+    route_id: &'a str,
+    data: &'a str,
+    binary: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RouteClose<'a> {
+    route_id: &'a str,
+}
+
+impl RoutedSocket {
+    pub(crate) fn new(
+        route_id: String,
+        origin: &Arc<Inner>,
+        events: flume::Receiver<RouteEvent>,
+    ) -> RoutedSocket {
+        RoutedSocket {
+            route_id,
+            origin: Arc::downgrade(origin),
+            events: events.into_stream(),
+        }
+    }
+
+    fn send(&self, message: Message) -> Result<(), tungstenite::Error> {
+        let unsendable = |error: serde_json::Error| tungstenite::Error::Io(io::Error::other(error));
+        let frame = match message {
+            Message::Text(text) => Frame::Text(
+                session_message(
+                    "hosts.route.frame.request",
+                    None,
+                    &RouteFrameRequest {
+                        route_id: &self.route_id,
+                        data: text.as_str(),
+                        binary: false,
+                    },
+                )
+                .map_err(unsendable)?,
+            ),
+            Message::Binary(bytes) => Frame::Binary(
+                HostRouteFrame {
+                    route_id: &self.route_id,
+                    payload: &bytes,
+                }
+                .encode(),
+            ),
+            Message::Close(_) => Frame::Text(
+                session_message(
+                    "hosts.route.close.request",
+                    None,
+                    &RouteClose {
+                        route_id: &self.route_id,
+                    },
+                )
+                .map_err(unsendable)?,
+            ),
+            Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => return Ok(()),
+        };
+        self.origin
+            .upgrade()
+            .ok_or(tungstenite::Error::AlreadyClosed)?
+            .send(frame)
+            .map_err(|_| tungstenite::Error::AlreadyClosed)
+    }
+}
+
+impl Drop for RoutedSocket {
+    fn drop(&mut self) {
+        if let Some(origin) = self.origin.upgrade() {
+            origin.release(&self.route_id);
+        }
+    }
+}
+
+impl FrameStream for Socket {
+    type Item = Result<Message, tungstenite::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.get_mut() {
+            Socket::Direct(socket) => socket.poll_next_unpin(cx),
+            Socket::Routed(socket) => socket.events.poll_next_unpin(cx).map(|event| {
+                event.map(|event| match event {
+                    RouteEvent::Frame(Frame::Text(text)) => Ok(Message::text(text)),
+                    RouteEvent::Frame(Frame::Binary(bytes)) => Ok(Message::binary(bytes)),
+                    RouteEvent::Closed(closed) => Err(tungstenite::Error::Io(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        closed,
+                    ))),
+                })
+            }),
+        }
+    }
+}
+
+impl Sink<Message> for Socket {
+    type Error = tungstenite::Error;
+
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        match self.get_mut() {
+            Socket::Direct(socket) => socket.poll_ready_unpin(cx),
+            Socket::Routed(_) => Poll::Ready(Ok(())),
+        }
+    }
+
+    fn start_send(self: Pin<&mut Self>, message: Message) -> Result<(), Self::Error> {
+        match self.get_mut() {
+            Socket::Direct(socket) => socket.start_send_unpin(message),
+            Socket::Routed(socket) => socket.send(message),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        match self.get_mut() {
+            Socket::Direct(socket) => socket.poll_flush_unpin(cx),
+            Socket::Routed(_) => Poll::Ready(Ok(())),
+        }
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        match self.get_mut() {
+            Socket::Direct(socket) => socket.poll_close_unpin(cx),
+            Socket::Routed(_) => Poll::Ready(Ok(())),
+        }
+    }
+}
 
 pub(crate) struct Connection {
     pub(crate) socket: Socket,
@@ -202,41 +367,57 @@ impl Connection {
                 ))
             }
             Endpoint::Unix(path) => Self::unix(path).await,
-            Endpoint::Ssh(target) => {
-                let stream = SshStream::spawn(target)?;
-                let diagnostics = stream.diagnostics.clone();
-                match client_async(target.ws_url(), Stream::Ssh(stream)).await {
-                    Ok((socket, _)) => Ok(Connection::plain(socket)),
-                    Err(error) => {
-                        let detail = diagnostics.lock().detail();
-                        if detail.is_empty() {
-                            return Err(error.into());
-                        }
-                        Err(PaseoError::Ssh { detail })
-                    }
-                }
-            }
+            Endpoint::Ssh(target) => Self::ssh(target).await,
             Endpoint::Relay(offer) => {
-                let channel = Channel::new(offer.daemon_public_key()?)?;
+                let handshake = Handshake::new(
+                    offer.daemon_public_key()?,
+                    offer
+                        .minimum_security_mode()
+                        .unwrap_or(SecurityMode::Legacy),
+                )?;
                 let address = HostPort::parse(offer.relay().endpoint())?;
                 let stream = Self::tcp(&address, offer.relay().use_tls(), tls).await?;
                 let mut socket = Self::upgrade(&offer.relay_ws_url()?, stream).await?;
-                Self::e2ee_handshake(&mut socket, &channel).await?;
+                let cipher = Self::e2ee_handshake(&mut socket, handshake).await?;
                 Ok(Connection {
                     socket,
                     wire: Wire {
-                        channel: Some(channel),
+                        cipher: Some(cipher),
                     },
                 })
             }
         }
     }
 
-    fn plain(socket: Socket) -> Connection {
+    pub(crate) fn plain(socket: Socket) -> Connection {
         Connection {
             socket,
-            wire: Wire { channel: None },
+            wire: Wire { cipher: None },
         }
+    }
+
+    #[cfg(feature = "ssh")]
+    async fn ssh(target: &SshTarget) -> Result<Connection, PaseoError> {
+        let stream = SshStream::spawn(target)?;
+        let diagnostics = stream.diagnostics.clone();
+        match Self::upgrade(&target.ws_url(), Stream::Ssh(stream)).await {
+            Ok(socket) => Ok(Connection::plain(socket)),
+            Err(error) => {
+                let detail = diagnostics.lock().detail();
+                if detail.is_empty() {
+                    return Err(error);
+                }
+                Err(PaseoError::Ssh { detail })
+            }
+        }
+    }
+
+    #[cfg(not(feature = "ssh"))]
+    async fn ssh(target: &SshTarget) -> Result<Connection, PaseoError> {
+        Err(EndpointError::SshUnsupported {
+            input: format!("ssh://{}", target.destination()),
+        }
+        .into())
     }
 
     #[cfg(unix)]
@@ -274,14 +455,21 @@ impl Connection {
 
     async fn upgrade(url: &str, stream: Stream) -> Result<Socket, PaseoError> {
         let request = url.into_client_request()?;
-        let (socket, _) = client_async(request, stream).await?;
-        Ok(socket)
+        let config = WebSocketConfig::default()
+            .max_message_size(Some(MAX_MESSAGE_BYTES))
+            .max_frame_size(Some(MAX_MESSAGE_BYTES));
+        let (socket, _) = client_async_with_config(request, stream, Some(config)).await?;
+        Ok(Socket::Direct(Box::new(socket)))
     }
 
-    async fn e2ee_handshake(socket: &mut Socket, channel: &Channel) -> Result<(), PaseoError> {
-        let hello = channel.hello_frame();
+    async fn e2ee_handshake(
+        socket: &mut Socket,
+        handshake: Handshake,
+    ) -> Result<Cipher, PaseoError> {
         loop {
-            socket.send(Message::text(hello.clone())).await?;
+            socket
+                .send(Message::text(handshake.hello_frame().to_owned()))
+                .await?;
             let retry = Timer::after(HANDSHAKE_RETRY);
             let next = match future::select(socket.next(), retry).await {
                 future::Either::Left((next, _)) => next,
@@ -295,16 +483,9 @@ impl Connection {
                 Some(Ok(Message::Text(text))) => text,
                 Some(Ok(_)) => continue,
             };
-            let Ok(ready) = serde_json::from_str::<Ready>(text.as_str()) else {
-                continue;
-            };
-            if ready.kind != "e2ee_ready" {
-                continue;
+            if is_ready(text.as_str()) {
+                return handshake.finish(text.as_str());
             }
-            if !ready.capabilities.binary_ciphertext {
-                return Err(ProtocolViolation::MissingBinaryCiphertext.into());
-            }
-            return Ok(());
         }
     }
 }
@@ -315,41 +496,30 @@ pub(crate) enum Frame {
 }
 
 pub(crate) struct Wire {
-    channel: Option<Channel>,
+    cipher: Option<Cipher>,
 }
 
 impl Wire {
+    pub(crate) fn security_mode(&self) -> Option<SecurityMode> {
+        self.cipher.as_ref().map(Cipher::mode)
+    }
+
     pub(crate) fn encode(&self, frame: Frame) -> Result<Message, PaseoError> {
-        Ok(match (&self.channel, frame) {
+        Ok(match (&self.cipher, frame) {
             (None, Frame::Text(text)) => Message::text(text),
             (None, Frame::Binary(bytes)) => Message::binary(bytes),
-            (Some(channel), Frame::Text(text)) => Message::text(channel.seal_text(&text)?),
-            (Some(channel), Frame::Binary(bytes)) => Message::binary(channel.seal(&bytes)?),
+            (Some(cipher), frame) => cipher.seal(frame)?,
         })
     }
 
     pub(crate) fn decode(&self, message: Message) -> Result<Option<Frame>, PaseoError> {
-        match (&self.channel, message) {
-            (None, Message::Text(text)) => Ok(Some(Frame::Text(text.as_str().to_owned()))),
-            (None, Message::Binary(bytes)) => Ok(Some(Frame::Binary(bytes.into()))),
-            (Some(channel), Message::Text(text)) => {
-                let text = text.as_str();
-                if text.trim_start().starts_with('{') {
-                    let ready = serde_json::from_str::<Ready>(text)
-                        .map_err(|_| ProtocolViolation::PlaintextOnEncryptedChannel)?;
-                    if ready.kind == "e2ee_ready" || ready.kind == "e2ee_hello" {
-                        return Ok(None);
-                    }
-                    return Err(ProtocolViolation::PlaintextOnEncryptedChannel.into());
-                }
-                Ok(Some(Frame::Text(channel.open_text(text)?)))
-            }
-            (Some(channel), Message::Binary(bytes)) => {
-                Ok(Some(Frame::Binary(channel.open(&bytes)?)))
-            }
+        match (&self.cipher, message) {
             (_, Message::Ping(_) | Message::Pong(_) | Message::Frame(_) | Message::Close(_)) => {
                 Ok(None)
             }
+            (None, Message::Text(text)) => Ok(Some(Frame::Text(text.as_str().to_owned()))),
+            (None, Message::Binary(bytes)) => Ok(Some(Frame::Binary(bytes.into()))),
+            (Some(cipher), message) => cipher.open(message),
         }
     }
 }

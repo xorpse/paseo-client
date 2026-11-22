@@ -1,12 +1,15 @@
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 use crate::error::ProtocolViolation;
+use crate::protocol::checkout::ForgeStatus;
 use crate::protocol::number::WireNumber;
 use crate::protocol::workspaces::AheadBehind;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiffMode {
+    All,
     Base,
     Uncommitted,
 }
@@ -33,6 +36,14 @@ impl DiffCompare {
     pub fn base(base_ref: Option<String>) -> DiffCompare {
         DiffCompare {
             mode: DiffMode::Base,
+            base_ref,
+            ignore_whitespace: None,
+        }
+    }
+
+    pub fn all(base_ref: Option<String>) -> DiffCompare {
+        DiffCompare {
+            mode: DiffMode::All,
             base_ref,
             ignore_whitespace: None,
         }
@@ -67,6 +78,8 @@ pub enum DiffLineKind {
     Context,
     Header,
     Remove,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -124,6 +137,8 @@ pub enum DiffFileStatus {
     Binary,
     Ok,
     TooLarge,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -178,9 +193,13 @@ impl DiffFile {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CheckoutErrorCode {
+    Binary,
     MergeConflict,
     NotAllowed,
+    NotFound,
     NotGitRepo,
+    TooLarge,
+    #[serde(other)]
     Unknown,
 }
 
@@ -236,6 +255,7 @@ pub struct CheckoutStatus {
     has_remote: bool,
     upstream_ref: Option<String>,
     repository: Option<GitRepositoryStatus>,
+    forge_status: Option<Box<ForgeStatus>>,
 }
 
 impl CheckoutStatus {
@@ -257,6 +277,10 @@ impl CheckoutStatus {
 
     pub fn repository(&self) -> Option<&GitRepositoryStatus> {
         self.repository.as_ref()
+    }
+
+    pub fn forge_status(&self) -> Option<&ForgeStatus> {
+        self.forge_status.as_deref()
     }
 }
 
@@ -314,6 +338,31 @@ impl GitRepositoryStatus {
     pub fn remote_url(&self) -> Option<&str> {
         self.remote_url.as_deref()
     }
+
+    pub fn remote_host(&self) -> Option<String> {
+        let remote = self.remote_url.as_deref()?.trim();
+        let host = if remote.contains("://") {
+            let url = Url::parse(remote).ok()?;
+            if !matches!(url.scheme(), "http" | "https" | "ssh") {
+                return None;
+            }
+            url.host_str()?.to_owned()
+        } else {
+            let (user, address) = remote.split_once('@')?;
+            let (host, path) = address.split_once(':')?;
+            if user.is_empty() || path.is_empty() {
+                return None;
+            }
+            host.to_owned()
+        };
+        let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        let valid = host.starts_with(|first: char| first.is_ascii_alphanumeric())
+            && host.ends_with(|last: char| last.is_ascii_alphanumeric())
+            && host
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || ".-_".contains(character));
+        valid.then_some(host)
+    }
 }
 
 #[derive(Deserialize)]
@@ -345,6 +394,8 @@ struct CheckoutStatusWire {
     has_remote: bool,
     #[serde(default)]
     remote_url: Option<String>,
+    #[serde(default)]
+    pr_status: Option<Box<ForgeStatus>>,
 }
 
 impl TryFrom<CheckoutStatusWire> for CheckoutStatus {
@@ -377,6 +428,7 @@ impl TryFrom<CheckoutStatusWire> for CheckoutStatus {
             has_remote: wire.has_remote,
             upstream_ref: wire.upstream_ref,
             repository,
+            forge_status: wire.pr_status,
         })
     }
 }

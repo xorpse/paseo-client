@@ -19,13 +19,14 @@ pub use channel::{
 pub use client::{
     ConnectOptions, PaseoClient, Subscription, TerminalHandle, TerminalSlot, TerminalWriter,
 };
+pub use e2ee::SecurityMode;
 pub use endpoint::{
     ConnectTarget, DEFAULT_SSH_DAEMON_PORT, Endpoint, HostPort, SshTarget, TcpEndpoint,
 };
 pub use error::{
-    ArgumentError, CryptoError, EndpointError, HelloRejection, PaseoError, ProtocolViolation,
-    RequestFailure, RpcError,
+    ArgumentError, CheckoutRejection, CryptoError, EndpointError, HelloRejection, PaseoError,
+    ProtocolViolation, RecordViolation, RequestFailure, RpcError,
 };
-pub use events::{EventKind, SessionEvent};
+pub use events::{EventKind, SessionEvent, StatusEvent};
 pub use offer::{ConnectionOffer, RelayInfo};
-pub use rpc::{AgentCreation, WorkspaceCreation};
+pub use rpc::{AgentCreation, DaemonUpdate, UsageReportFetch, WorkspaceCreation};

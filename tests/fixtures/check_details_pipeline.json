@@ -1,0 +1,39 @@
+{
+  "cwd": "/repo",
+  "success": true,
+  "details": {
+    "checkRunId": 306,
+    "name": "Pipeline (feat/x)",
+    "annotations": [],
+    "failedJobs": [],
+    "truncated": false,
+    "pipeline": {
+      "id": 306,
+      "status": "success",
+      "rawStatus": "success",
+      "url": "https://gitlab.example.com/g/r/-/pipelines/306",
+      "ref": "feat/x",
+      "sha": "abc",
+      "stages": [
+        {
+          "name": "test",
+          "status": "success",
+          "jobs": [
+            {
+              "id": 1,
+              "name": "unit",
+              "stage": "test",
+              "status": "success",
+              "rawStatus": "success",
+              "url": null,
+              "allowFailure": false,
+              "durationSeconds": 4
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "error": null,
+  "requestId": "check-details"
+}

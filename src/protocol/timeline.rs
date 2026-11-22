@@ -1,10 +1,11 @@
-use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
-
 use std::num::NonZeroU64;
+
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::{Map, Value};
 
 use crate::protocol::agents::AgentSnapshot;
 use crate::protocol::number::WireNumber;
+use crate::protocol::recognised::{recognised, recognised_optional};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -12,6 +13,8 @@ pub enum WorktreeSetupCommandStatus {
     Completed,
     Failed,
     Running,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -98,6 +101,8 @@ pub enum SearchTool {
     Grep,
     Search,
     WebSearch,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -106,6 +111,8 @@ pub enum SearchMode {
     Content,
     Count,
     FilesWithMatches,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -427,6 +434,25 @@ pub struct UnknownDetail {
     output: Value,
 }
 
+fn unrecognised_detail() -> ToolCallDetail {
+    ToolCallDetail::Unknown(UnknownDetail {
+        input: Value::Null,
+        output: Value::Null,
+    })
+}
+
+fn tool_call_detail<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<ToolCallDetail, D::Error> {
+    Ok(recognised(deserializer)?.unwrap_or_else(unrecognised_detail))
+}
+
+pub(crate) fn optional_tool_call_detail<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<ToolCallDetail>, D::Error> {
+    Ok(recognised_optional(deserializer)?.map(|detail| detail.unwrap_or_else(unrecognised_detail)))
+}
+
 impl UnknownDetail {
     pub fn input(&self) -> &Value {
         &self.input
@@ -463,6 +489,8 @@ pub enum AgentMessageEvent {
     Finished,
     Message,
     PermissionRequired,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -509,6 +537,7 @@ pub enum ToolCallStatus {
     Completed,
     Failed(Value),
     Running,
+    Unknown,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -555,6 +584,8 @@ enum ToolCallStatusWire {
     Completed,
     Failed,
     Running,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Deserialize)]
@@ -562,6 +593,7 @@ enum ToolCallStatusWire {
 struct ToolCallWire {
     call_id: String,
     name: String,
+    #[serde(deserialize_with = "tool_call_detail")]
     detail: ToolCallDetail,
     status: ToolCallStatusWire,
     #[serde(default)]
@@ -579,6 +611,7 @@ impl From<ToolCallWire> for ToolCall {
             ToolCallStatusWire::Completed => ToolCallStatus::Completed,
             ToolCallStatusWire::Failed => ToolCallStatus::Failed(wire.error),
             ToolCallStatusWire::Running => ToolCallStatus::Running,
+            ToolCallStatusWire::Unknown => ToolCallStatus::Unknown,
         };
         ToolCall {
             call_id: wire.call_id,
@@ -597,6 +630,8 @@ pub enum TodoStatus {
     Completed,
     InProgress,
     Pending,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -640,6 +675,8 @@ pub enum NotificationLevel {
     Error,
     Info,
     Warning,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -647,6 +684,8 @@ pub enum NotificationLevel {
 pub enum CompactionStatus {
     Completed,
     Loading,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -654,6 +693,8 @@ pub enum CompactionStatus {
 pub enum CompactionTrigger {
     Auto,
     Manual,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -667,6 +708,8 @@ pub enum TimelineItem {
     Todo(TodoItem),
     ToolCall(Box<ToolCall>),
     UserMessage(UserMessageItem),
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -831,6 +874,8 @@ pub enum TimelineCollapse {
     Identity,
     ReasoningMerge,
     ToolLifecycle,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -887,6 +932,8 @@ pub enum TimelineDirection {
     After,
     Before,
     Tail,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -894,6 +941,8 @@ pub enum TimelineDirection {
 pub enum TimelineProjection {
     Canonical,
     Projected,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -1043,6 +1092,11 @@ impl TimelineQuery {
         }
     }
 
+    pub fn with_limit(mut self, limit: u32) -> TimelineQuery {
+        self.limit = Some(limit);
+        self
+    }
+
     pub fn projection(&self) -> Option<TimelineProjection> {
         self.projection
     }
@@ -1054,5 +1108,58 @@ impl TimelineQuery {
     pub fn with_projection(mut self, projection: TimelineProjection) -> TimelineQuery {
         self.set_projection(projection);
         self
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageRole {
+    Assistant,
+    User,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+pub struct TimelineMatch {
+    seq: u64,
+    role: MessageRole,
+    #[serde(default)]
+    count: Option<u32>,
+}
+
+impl TimelineMatch {
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    pub fn role(&self) -> MessageRole {
+        self.role
+    }
+
+    pub fn count(&self) -> Option<u32> {
+        self.count
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineSearch {
+    epoch: String,
+    locations: Vec<TimelineMatch>,
+    next_cursor: Option<u64>,
+}
+
+impl TimelineSearch {
+    pub fn epoch(&self) -> &str {
+        &self.epoch
+    }
+
+    pub fn matches(&self) -> &[TimelineMatch] {
+        &self.locations
+    }
+
+    pub fn next_cursor(&self) -> Option<u64> {
+        self.next_cursor
     }
 }

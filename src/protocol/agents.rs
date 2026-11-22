@@ -8,7 +8,8 @@ use crate::client::new_id;
 use crate::error::ArgumentError;
 use crate::protocol::diff::DiffMode;
 use crate::protocol::number::WireNumber;
-use crate::protocol::timeline::{TimelineCursor, ToolCallDetail};
+use crate::protocol::recognised::recognised_entries;
+use crate::protocol::timeline::{TimelineCursor, ToolCallDetail, optional_tool_call_detail};
 use crate::protocol::workspaces::{ProjectPlacement, WorkspaceDescriptor};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -19,6 +20,8 @@ pub enum AgentStatus {
     Idle,
     Initializing,
     Running,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -27,6 +30,8 @@ pub enum AttentionReason {
     Error,
     Finished,
     Permission,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -377,6 +382,8 @@ pub enum PermissionKind {
     Plan,
     Question,
     Tool,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -384,6 +391,8 @@ pub enum PermissionKind {
 pub enum PermissionBehavior {
     Allow,
     Deny,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -392,6 +401,8 @@ pub enum PermissionActionVariant {
     Danger,
     Primary,
     Secondary,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -400,6 +411,8 @@ pub enum PermissionActionIntent {
     Dismiss,
     Implement,
     ImplementResume,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -449,7 +462,7 @@ pub struct PermissionRequest {
     description: Option<String>,
     #[serde(default)]
     input: Option<Map<String, Value>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "optional_tool_call_detail")]
     detail: Option<ToolCallDetail>,
     #[serde(default)]
     suggestions: Vec<Map<String, Value>>,
@@ -510,6 +523,8 @@ impl PermissionRequest {
 pub enum PermissionResponse {
     Allow(PermissionAllow),
     Deny(PermissionDeny),
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -665,6 +680,8 @@ pub struct AgentRuntimeInfo {
     thinking_option_id: Option<String>,
     #[serde(default)]
     mode_id: Option<String>,
+    #[serde(default)]
+    extra: Map<String, Value>,
 }
 
 impl AgentRuntimeInfo {
@@ -686,6 +703,10 @@ impl AgentRuntimeInfo {
 
     pub fn mode_id(&self) -> Option<&str> {
         self.mode_id.as_deref()
+    }
+
+    pub fn extra(&self) -> &Map<String, Value> {
+        &self.extra
     }
 }
 
@@ -715,7 +736,7 @@ pub struct AgentSnapshot {
     #[serde(default)]
     workspace_id: Option<String>,
     model: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "recognised_entries")]
     features: Vec<AgentFeature>,
     #[serde(default)]
     thinking_option_id: Option<String>,
@@ -749,6 +770,10 @@ pub struct AgentSnapshot {
     attention_timestamp: Option<String>,
     #[serde(default)]
     archived_at: Option<String>,
+    #[serde(default)]
+    pinned_at: Option<String>,
+    #[serde(default)]
+    last_response_at: Option<String>,
     #[serde(default)]
     provider_unavailable: bool,
 }
@@ -870,6 +895,15 @@ impl AgentSnapshot {
         self.archived_at.as_deref()
     }
 
+    pub fn pinned_at(&self) -> Option<&str> {
+        self.pinned_at.as_deref()
+    }
+
+    /// When the agent last finished a turn. Unlike `updated_at`, other changes don't move it.
+    pub fn last_response_at(&self) -> Option<&str> {
+        self.last_response_at.as_deref()
+    }
+
     pub fn provider_unavailable(&self) -> bool {
         self.provider_unavailable
     }
@@ -940,6 +974,8 @@ impl AgentDirectoryPage {
 pub enum AgentUpdate {
     Remove(AgentRemoval),
     Upsert(AgentUpsert),
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -1153,6 +1189,8 @@ pub enum NoticeLevel {
     Error,
     Info,
     Warning,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -1528,6 +1566,197 @@ impl ExternalResource {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForgeIssueAttachment {
+    mime_type: &'static str,
+    forge: String,
+    number: u64,
+    title: String,
+    url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project_path: Option<String>,
+}
+
+impl ForgeIssueAttachment {
+    pub fn new(
+        forge: impl Into<String>,
+        number: u64,
+        title: impl Into<String>,
+        url: impl Into<String>,
+    ) -> ForgeIssueAttachment {
+        ForgeIssueAttachment {
+            mime_type: "application/paseo-forge-issue",
+            forge: forge.into(),
+            number,
+            title: title.into(),
+            url: url.into(),
+            body: None,
+            project_path: None,
+        }
+    }
+
+    pub fn forge(&self) -> &str {
+        &self.forge
+    }
+
+    pub fn number(&self) -> u64 {
+        self.number
+    }
+
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub fn body(&self) -> Option<&str> {
+        self.body.as_deref()
+    }
+
+    pub fn set_body(&mut self, body: impl Into<String>) {
+        self.body = Some(body.into());
+    }
+
+    pub fn with_body(mut self, body: impl Into<String>) -> ForgeIssueAttachment {
+        self.set_body(body);
+        self
+    }
+
+    pub fn project_path(&self) -> Option<&str> {
+        self.project_path.as_deref()
+    }
+
+    pub fn set_project_path(&mut self, project_path: impl Into<String>) {
+        self.project_path = Some(project_path.into());
+    }
+
+    pub fn with_project_path(mut self, project_path: impl Into<String>) -> ForgeIssueAttachment {
+        self.set_project_path(project_path);
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForgeChangeRequestAttachment {
+    mime_type: &'static str,
+    forge: String,
+    number: u64,
+    title: String,
+    url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_ref_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    head_ref_name: Option<String>,
+}
+
+impl ForgeChangeRequestAttachment {
+    pub fn new(
+        forge: impl Into<String>,
+        number: u64,
+        title: impl Into<String>,
+        url: impl Into<String>,
+    ) -> ForgeChangeRequestAttachment {
+        ForgeChangeRequestAttachment {
+            mime_type: "application/paseo-forge-change-request",
+            forge: forge.into(),
+            number,
+            title: title.into(),
+            url: url.into(),
+            body: None,
+            project_path: None,
+            base_ref_name: None,
+            head_ref_name: None,
+        }
+    }
+
+    pub fn forge(&self) -> &str {
+        &self.forge
+    }
+
+    pub fn number(&self) -> u64 {
+        self.number
+    }
+
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub fn body(&self) -> Option<&str> {
+        self.body.as_deref()
+    }
+
+    pub fn set_body(&mut self, body: impl Into<String>) {
+        self.body = Some(body.into());
+    }
+
+    pub fn with_body(mut self, body: impl Into<String>) -> ForgeChangeRequestAttachment {
+        self.set_body(body);
+        self
+    }
+
+    pub fn project_path(&self) -> Option<&str> {
+        self.project_path.as_deref()
+    }
+
+    pub fn set_project_path(&mut self, project_path: impl Into<String>) {
+        self.project_path = Some(project_path.into());
+    }
+
+    pub fn with_project_path(
+        mut self,
+        project_path: impl Into<String>,
+    ) -> ForgeChangeRequestAttachment {
+        self.set_project_path(project_path);
+        self
+    }
+
+    pub fn base_ref_name(&self) -> Option<&str> {
+        self.base_ref_name.as_deref()
+    }
+
+    pub fn set_base_ref_name(&mut self, base_ref_name: impl Into<String>) {
+        self.base_ref_name = Some(base_ref_name.into());
+    }
+
+    pub fn with_base_ref_name(
+        mut self,
+        base_ref_name: impl Into<String>,
+    ) -> ForgeChangeRequestAttachment {
+        self.set_base_ref_name(base_ref_name);
+        self
+    }
+
+    pub fn head_ref_name(&self) -> Option<&str> {
+        self.head_ref_name.as_deref()
+    }
+
+    pub fn set_head_ref_name(&mut self, head_ref_name: impl Into<String>) {
+        self.head_ref_name = Some(head_ref_name.into());
+    }
+
+    pub fn with_head_ref_name(
+        mut self,
+        head_ref_name: impl Into<String>,
+    ) -> ForgeChangeRequestAttachment {
+        self.set_head_ref_name(head_ref_name);
+        self
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TextAttachment {
@@ -1819,6 +2048,8 @@ impl UploadedFileAttachment {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentAttachment {
+    ForgeChangeRequest(ForgeChangeRequestAttachment),
+    ForgeIssue(ForgeIssueAttachment),
     Review(ReviewAttachment),
     Text(TextAttachment),
     UploadedFile(UploadedFileAttachment),
@@ -2110,11 +2341,23 @@ impl AgentCreateRequest {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CreationKind {
     Agent,
     Workspace,
+    #[serde(other)]
+    Unknown,
+}
+
+impl CreationKind {
+    pub(crate) fn update_type(self) -> Option<&'static str> {
+        match self {
+            CreationKind::Agent => Some("agent.create.update"),
+            CreationKind::Unknown => None,
+            CreationKind::Workspace => Some("workspace.create.update"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -2126,6 +2369,8 @@ pub enum CreationPhase {
     Failed,
     PromptStarted,
     WorkspaceReady,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -2134,6 +2379,8 @@ pub enum CreationStage {
     Agent,
     Prompt,
     Workspace,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -2351,6 +2598,8 @@ pub enum WaitStatus {
     Idle,
     Permission,
     Timeout,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]

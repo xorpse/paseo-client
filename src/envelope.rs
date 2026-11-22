@@ -43,6 +43,7 @@ pub(crate) struct NoFields {}
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub(crate) enum HelloAuth<'a> {
+    LocalCredential { token: &'a str },
     Password { password: &'a str },
 }
 
@@ -62,6 +63,7 @@ pub(crate) struct Capabilities {
     timeline_notifications: bool,
     timeline_replacement_invalidation: bool,
     workspace_setup_blocked: bool,
+    workspace_setup_observation: bool,
 }
 
 impl Capabilities {
@@ -80,6 +82,7 @@ impl Capabilities {
         timeline_notifications: true,
         timeline_replacement_invalidation: true,
         workspace_setup_blocked: true,
+        workspace_setup_observation: true,
     };
 }
 
@@ -101,7 +104,7 @@ pub(crate) struct Hello<'a> {
 impl<'a> Hello<'a> {
     pub(crate) fn new(
         client_id: &'a str,
-        password: Option<&'a str>,
+        auth: Option<HelloAuth<'a>>,
         app_version: Option<&'a str>,
     ) -> Hello<'a> {
         Hello {
@@ -109,7 +112,7 @@ impl<'a> Hello<'a> {
             client_id,
             client_type: "cli",
             protocol_version: 1,
-            auth: password.map(|password| HelloAuth::Password { password }),
+            auth,
             app_version,
             capabilities: &Capabilities::SUPPORTED,
         }

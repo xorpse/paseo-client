@@ -1,0 +1,64 @@
+{
+  "requestId": "req-workspaces",
+  "entries": [
+    {
+      "id": "ws-main",
+      "projectId": "remote:github.com/acme/repo",
+      "projectDisplayName": "acme/repo",
+      "projectCustomIconRevision": "4b0c8e2a-2f3e-4f1e-9b7a-7b1e2b0c9d11",
+      "projectRootPath": "/tmp/repo",
+      "workspaceDirectory": "/tmp/repo",
+      "setupStatus": "completed",
+      "projectKind": "git",
+      "workspaceKind": "local_checkout",
+      "name": "main",
+      "status": "done",
+      "statusEnteredAt": "2026-04-12T00:00:00.000Z",
+      "activityAt": null,
+      "createdAt": "2026-04-10T09:30:00.000Z",
+      "lastUserMessageAt": "2026-04-11T17:45:00.000Z",
+      "diffStat": { "additions": 3, "deletions": 1 },
+      "gitRuntime": {
+        "currentBranch": "main",
+        "remoteUrl": "https://github.com/acme/repo.git",
+        "isPaseoOwnedWorktree": false,
+        "isDirty": true,
+        "aheadBehind": { "ahead": 2, "behind": 1 },
+        "aheadOfOrigin": 2,
+        "behindOfOrigin": 1
+      },
+      "githubRuntime": {
+        "featuresEnabled": true,
+        "pullRequest": {
+          "number": 123,
+          "url": "https://github.com/acme/repo/pull/123",
+          "title": "Runtime payloads",
+          "state": "open",
+          "baseRefName": "main",
+          "headRefName": "workspace-git-service",
+          "isMerged": false,
+          "mergeable": "BLOCKED",
+          "checks": [
+            { "name": "legacy", "status": "success", "url": null },
+            {
+              "name": "deploy",
+              "status": "pending",
+              "url": null,
+              "traits": ["manual", "action_required", "future-forge-trait"]
+            }
+          ],
+          "checksStatus": "pending",
+          "reviewDecision": "changes_requested",
+          "repoOwner": "acme",
+          "repoName": "repo"
+        },
+        "error": null,
+        "refreshedAt": "2026-04-12T00:00:00.000Z"
+      },
+      "forge": "github",
+      "syncSeq": 7
+    }
+  ],
+  "emptyProjects": [],
+  "pageInfo": { "nextCursor": null, "prevCursor": null, "hasMore": false }
+}

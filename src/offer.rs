@@ -3,6 +3,7 @@ use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use serde::Deserialize;
 use url::Url;
 
+use crate::e2ee::SecurityMode;
 use crate::endpoint::HostPort;
 use crate::error::{CryptoError, EndpointError};
 
@@ -32,6 +33,8 @@ pub struct ConnectionOffer {
     server_id: String,
     daemon_public_key_b64: String,
     relay: RelayInfo,
+    #[serde(default)]
+    minimum_security_mode: Option<SecurityMode>,
 }
 
 impl ConnectionOffer {
@@ -41,6 +44,23 @@ impl ConnectionOffer {
 
     pub fn relay(&self) -> &RelayInfo {
         &self.relay
+    }
+
+    pub fn daemon_public_key_b64(&self) -> &str {
+        &self.daemon_public_key_b64
+    }
+
+    pub fn minimum_security_mode(&self) -> Option<SecurityMode> {
+        self.minimum_security_mode
+    }
+
+    pub fn set_minimum_security_mode(&mut self, mode: Option<SecurityMode>) {
+        self.minimum_security_mode = mode;
+    }
+
+    pub fn with_minimum_security_mode(mut self, mode: Option<SecurityMode>) -> ConnectionOffer {
+        self.set_minimum_security_mode(mode);
+        self
     }
 
     pub fn parse_url(input: &str) -> Result<ConnectionOffer, EndpointError> {
@@ -91,6 +111,16 @@ impl ConnectionOffer {
         let use_tls = url
             .query_pairs()
             .any(|(name, value)| name == "ssl" && value == "true");
+        let minimum_security_mode = match url.query_pairs().find(|(name, _)| name == "security") {
+            None => None,
+            Some((_, value)) if value == "protected" => Some(SecurityMode::Protected),
+            Some(_) => {
+                return Err(EndpointError::UnsupportedPart {
+                    input: input.to_owned(),
+                    part: "security".to_owned(),
+                });
+            }
+        };
         let endpoint = HostPort::new(host.trim_start_matches('[').trim_end_matches(']'), port);
         Ok(ConnectionOffer {
             server_id,
@@ -99,6 +129,7 @@ impl ConnectionOffer {
                 endpoint: endpoint.to_string(),
                 use_tls: Some(use_tls),
             },
+            minimum_security_mode,
         })
     }
 

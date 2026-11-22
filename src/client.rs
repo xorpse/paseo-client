@@ -1,5 +1,6 @@
 use std::borrow::Cow;
-use std::collections::{HashMap, hash_map::Entry};
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::future::Future;
 use std::pin::pin;
 use std::sync::{Arc, Weak};
@@ -7,9 +8,9 @@ use std::time::Duration;
 
 use async_io::Timer;
 use async_tungstenite::tungstenite::Message;
-use futures::StreamExt;
 use futures::channel::oneshot;
 use futures::future::{self, Either};
+use futures::{SinkExt, StreamExt};
 use futures_rustls::rustls::ClientConfig;
 use parking_lot::Mutex;
 use serde::de::Error as _;
@@ -17,17 +18,24 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json::value::RawValue;
 
-use crate::binary_frames::{ChannelFrame, Opcode, ResizeIntent, ResizePayload, TerminalFrame};
+use crate::binary_frames::{
+    ChannelFrame, FileTransferFrame, HostRouteFrame, Opcode, ResizeIntent, ResizePayload,
+    TerminalFrame,
+};
 use crate::channel::ChannelEndpoint;
+use crate::e2ee::SecurityMode;
 use crate::endpoint::ConnectTarget;
-use crate::envelope::{Envelope, Hello, MessageHead, PING, PayloadHead, session_message};
-use crate::error::{PaseoError, ProtocolViolation, RpcError};
+use crate::envelope::{
+    Envelope, Hello, HelloAuth, MessageHead, PING, PayloadHead, session_message,
+};
+use crate::error::{HostRouteClosed, PaseoError, ProtocolViolation, RpcError};
 use crate::protocol::agents::CreationSnapshot;
 use crate::protocol::daemon::{DaemonFeature, ServerInfo};
+use crate::protocol::files::{FileContent, TransferMetadata};
 use crate::protocol::terminals::{TerminalSize, TerminalStreamEvent};
-use crate::transport::{Connection, Frame, Socket, Wire};
+use crate::transport::{Connection, Frame, RouteEvent, Socket, Wire};
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const LIVENESS_INTERVAL: Duration = Duration::from_secs(10);
 const LIVENESS_TIMEOUT: Duration = Duration::from_secs(15);
@@ -103,6 +111,7 @@ struct Route {
     deliver: Deliver,
     terminal_slot: Option<u8>,
     channel: Option<u32>,
+    host_route: Option<flume::Sender<RouteEvent>>,
 }
 
 struct SlotOwner {
@@ -119,6 +128,76 @@ struct Pending {
     request_type: &'static str,
     reply: oneshot::Sender<Reply>,
     registration: Option<Registration>,
+    tracking: Option<Tracking>,
+}
+
+pub(crate) enum Tracking {
+    Download(Download),
+    Progress {
+        kind: &'static str,
+        deliver: Deliver,
+    },
+}
+
+pub(crate) struct Download {
+    path: String,
+    metadata: Option<TransferMetadata>,
+    bytes: Vec<u8>,
+    finished: oneshot::Sender<Result<FileContent, PaseoError>>,
+}
+
+impl Download {
+    const MAX_RESERVED_BYTES: u64 = 16 * 1024 * 1024;
+
+    pub(crate) fn new(
+        path: &str,
+        finished: oneshot::Sender<Result<FileContent, PaseoError>>,
+    ) -> Download {
+        Download {
+            path: path.to_owned(),
+            metadata: None,
+            bytes: Vec::new(),
+            finished,
+        }
+    }
+
+    fn begin(&mut self, metadata: TransferMetadata) {
+        let reserved = metadata.size().min(Download::MAX_RESERVED_BYTES);
+        self.bytes = Vec::with_capacity(
+            usize::try_from(reserved).expect("the reservation is capped at 16 MiB"),
+        );
+        self.metadata = Some(metadata);
+    }
+
+    fn append(&mut self, payload: &[u8]) {
+        self.bytes.extend_from_slice(payload);
+    }
+
+    fn finish(self) {
+        let Download {
+            path,
+            metadata,
+            bytes,
+            finished,
+        } = self;
+        let received = u64::try_from(bytes.len()).expect("a download's length fits in 64 bits");
+        let content = match metadata {
+            None => Err(ProtocolViolation::FileTransferWithoutBegin.into()),
+            Some(metadata) if metadata.size() != received => {
+                Err(ProtocolViolation::FileTransferIncomplete {
+                    expected: metadata.size(),
+                    received,
+                }
+                .into())
+            }
+            Some(metadata) => Ok(FileContent::streamed(&path, metadata, bytes)),
+        };
+        finished.send(content).ok();
+    }
+
+    fn fail(self, error: PaseoError) {
+        self.finished.send(Err(error)).ok();
+    }
 }
 
 #[derive(Default)]
@@ -145,6 +224,7 @@ pub(crate) enum Outgoing {
 
 pub(crate) struct Inner {
     server_info: ServerInfo,
+    security_mode: Option<SecurityMode>,
     outgoing: flume::Sender<Outgoing>,
     pongs: flume::Sender<()>,
     state: Mutex<State>,
@@ -175,25 +255,33 @@ impl PaseoClient {
         options: &ConnectOptions,
     ) -> Result<PaseoClient, PaseoError> {
         let connect = async {
-            let Connection { mut socket, wire } =
-                Connection::open(target.endpoint(), &options.tls).await?;
-            let hello = Hello::new(
-                &options.client_id,
-                target.password(),
-                options.app_version.as_deref(),
-            );
-            socket
-                .send(wire.encode(Frame::Text(serde_json::to_string(&hello)?))?)
-                .await?;
-            let server_info = Self::await_server_info(&mut socket, &wire).await?;
-            Ok::<_, PaseoError>((socket, wire, server_info))
+            let connection = Connection::open(target.endpoint(), &options.tls).await?;
+            Self::handshake(connection, target.hello_auth(), options).await
         };
-        let (socket, wire, server_info) =
-            timed(connect, CONNECT_TIMEOUT)
-                .await
-                .ok_or(PaseoError::Timeout {
-                    request_type: "connect",
-                })??;
+        timed(connect, CONNECT_TIMEOUT)
+            .await
+            .ok_or(PaseoError::Timeout {
+                request_type: "connect",
+            })?
+    }
+
+    pub(crate) async fn handshake(
+        connection: Connection,
+        auth: Option<HelloAuth<'_>>,
+        options: &ConnectOptions,
+    ) -> Result<PaseoClient, PaseoError> {
+        let Connection { mut socket, wire } = connection;
+        let hello = Hello::new(&options.client_id, auth, options.app_version.as_deref());
+        socket
+            .send(wire.encode(Frame::Text(serde_json::to_string(&hello)?))?)
+            .await?;
+        let server_info = Self::await_server_info(&mut socket, &wire).await?;
+        let security_mode = wire.security_mode();
+        if security_mode == Some(SecurityMode::Legacy)
+            && server_info.supports(DaemonFeature::RelayProtectedSecurity)
+        {
+            return Err(ProtocolViolation::LegacySecurityRefused.into());
+        }
         for feature in REQUIRED_FEATURES {
             if !server_info.supports(feature) && !options.outdated_daemons {
                 return Err(PaseoError::UnsupportedDaemon {
@@ -206,6 +294,7 @@ impl PaseoClient {
         Ok(PaseoClient {
             inner: Arc::new(Inner {
                 server_info,
+                security_mode,
                 outgoing,
                 pongs,
                 state: Mutex::new(State {
@@ -256,6 +345,10 @@ impl PaseoClient {
 
     pub fn server_info(&self) -> &ServerInfo {
         &self.inner.server_info
+    }
+
+    pub fn security_mode(&self) -> Option<SecurityMode> {
+        self.inner.security_mode
     }
 
     pub fn is_connected(&self) -> bool {
@@ -402,18 +495,30 @@ impl Inner {
         let mut state = self.state.lock();
         if let Some(request_id) = payload_head.request_id.as_deref()
             && let Entry::Occupied(entry) = state.pending.entry(request_id.to_owned())
-            && (head.kind == entry.get().response_type || head.kind == "rpc_error")
         {
-            let pending = entry.remove();
-            let reply = Self::reply(
-                &mut state,
-                pending.registration,
-                &head,
-                &payload_head,
-                pending.request_type,
-            );
-            pending.reply.send(reply).ok();
-            return;
+            if head.kind == entry.get().response_type || head.kind == "rpc_error" {
+                let pending = entry.remove();
+                let reply = Self::reply(
+                    &mut state,
+                    pending.registration,
+                    &head,
+                    &payload_head,
+                    pending.request_type,
+                );
+                pending.reply.send(reply).ok();
+                return;
+            }
+            let progress = match &entry.get().tracking {
+                Some(Tracking::Progress { kind, deliver }) if head.kind == *kind => {
+                    Some(deliver.clone())
+                }
+                _ => None,
+            };
+            if let Some(deliver) = progress {
+                drop(state);
+                deliver(&head.kind, message);
+                return;
+            }
         }
         if let Some(subscription_id) = payload_head.subscription_id.as_deref() {
             match state
@@ -508,6 +613,24 @@ impl Inner {
             }
             return;
         }
+        if let Some(frame) = HostRouteFrame::decode(bytes) {
+            let route = self
+                .state
+                .lock()
+                .routes
+                .get(frame.route_id)
+                .and_then(|route| route.host_route.clone());
+            if let Some(route) = route {
+                route
+                    .send(RouteEvent::Frame(Frame::Binary(frame.payload.to_vec())))
+                    .ok();
+            }
+            return;
+        }
+        if let Some(frame) = FileTransferFrame::decode(bytes) {
+            self.receive_file_frame(&frame);
+            return;
+        }
         let Some(frame) = TerminalFrame::decode(bytes) else {
             return;
         };
@@ -524,6 +647,38 @@ impl Inner {
             Opcode::Input | Opcode::Resize => return,
         };
         events.send(event).ok();
+    }
+
+    fn receive_file_frame(&self, frame: &FileTransferFrame<'_>) {
+        let mut state = self.state.lock();
+        let Entry::Occupied(mut entry) = state.pending.entry(frame.request_id().to_owned()) else {
+            return;
+        };
+        let Some(Tracking::Download(download)) = &mut entry.get_mut().tracking else {
+            return;
+        };
+        let outcome = match frame {
+            FileTransferFrame::Begin { metadata, .. } => {
+                match serde_json::from_slice::<TransferMetadata>(metadata) {
+                    Ok(metadata) => {
+                        download.begin(metadata);
+                        return;
+                    }
+                    Err(error) => Err(PaseoError::decode("file transfer metadata", error)),
+                }
+            }
+            FileTransferFrame::Chunk { payload, .. } => {
+                download.append(payload);
+                return;
+            }
+            FileTransferFrame::End { .. } => Ok(()),
+        };
+        if let Some(Tracking::Download(download)) = entry.remove().tracking {
+            match outcome {
+                Ok(()) => download.finish(),
+                Err(error) => download.fail(error),
+            }
+        }
     }
 
     pub(crate) fn release(&self, subscription_id: &str) {
@@ -557,6 +712,7 @@ impl Inner {
         self: &Arc<Self>,
         request: &Request<'_, B>,
         registration: Option<Registration>,
+        tracking: Option<Tracking>,
     ) -> Result<PendingReply, PaseoError> {
         let request_id = new_id();
         let text = session_message(request.kind, Some(&request_id), request.body)?;
@@ -573,6 +729,7 @@ impl Inner {
                     request_type: request.kind,
                     reply,
                     registration,
+                    tracking,
                 },
             );
         }
@@ -594,21 +751,64 @@ impl Inner {
         self.state.lock().creations.remove(key);
     }
 
-    pub(crate) fn route_registration<U: Routed>(
-        updates: Updates<U>,
-        response_type: &'static str,
-    ) -> Registration {
+    pub(crate) fn route_registration<U: Routed>(updates: Updates<U>) -> Registration {
         Box::new(move |state, head, _payload| {
-            let id = head
-                .subscription_id
-                .as_deref()
-                .ok_or(ProtocolViolation::MissingSubscriptionId { response_type })?;
+            if let Some(id) = head.subscription_id.as_deref() {
+                state.routes.insert(
+                    id.to_owned(),
+                    Route {
+                        deliver: Self::deliver(updates),
+                        terminal_slot: None,
+                        channel: None,
+                        host_route: None,
+                    },
+                );
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn host_route_registration(
+        events: flume::Sender<RouteEvent>,
+        response_type: &'static str,
+        route: oneshot::Sender<String>,
+    ) -> Registration {
+        Box::new(move |state, _head, payload| {
+            let opened = serde_json::from_str::<RouteOpened>(payload.get())
+                .map_err(|error| PaseoError::decode(response_type, error))?;
+            if opened.route_id.is_empty()
+                || opened.route_id.len() > HostRouteFrame::MAX_ROUTE_ID_BYTES
+            {
+                return Err(ProtocolViolation::InvalidRouteId.into());
+            }
+            let frames = events.clone();
+            let deliver = Arc::new(move |kind: &str, message: &RawValue| {
+                let event = match kind {
+                    "hosts.route.frame" => {
+                        serde_json::from_str::<Payload<RouteText>>(message.get())
+                            .map(|message| RouteEvent::Frame(Frame::Text(message.payload.data)))
+                    }
+                    "hosts.route.closed" => {
+                        serde_json::from_str::<Payload<HostRouteClosed>>(message.get())
+                            .map(|message| RouteEvent::Closed(message.payload))
+                    }
+                    _ => return,
+                };
+                match event {
+                    Ok(event) => {
+                        frames.send(event).ok();
+                    }
+                    Err(error) => log::warn!("dropping an undecodable {kind}: {error}"),
+                }
+            });
+            route.send(opened.route_id.clone()).ok();
             state.routes.insert(
-                id.to_owned(),
+                opened.route_id,
                 Route {
-                    deliver: Self::deliver(updates),
+                    deliver,
                     terminal_slot: None,
                     channel: None,
+                    host_route: Some(events),
                 },
             );
             Ok(())
@@ -642,6 +842,7 @@ impl Inner {
                     deliver: events,
                     terminal_slot: None,
                     channel: Some(number),
+                    host_route: None,
                 },
             );
             Ok(())
@@ -679,13 +880,14 @@ impl Inner {
                     deliver: Self::deliver(events),
                     terminal_slot: Some(slot),
                     channel: None,
+                    host_route: None,
                 },
             );
             Ok(())
         })
     }
 
-    fn deliver<U: Routed>(updates: Updates<U>) -> Deliver {
+    pub(crate) fn deliver<U: Routed>(updates: Updates<U>) -> Deliver {
         Arc::new(move |kind, message| {
             updates.send(U::decode(kind, message)).ok();
         })
@@ -717,6 +919,17 @@ struct SubscriptionRelease<'a> {
 struct CreationKey<'a> {
     #[serde(borrow)]
     idempotency_key: Cow<'a, str>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RouteOpened {
+    route_id: String,
+}
+
+#[derive(Deserialize)]
+struct RouteText {
+    data: String,
 }
 
 #[derive(Deserialize)]

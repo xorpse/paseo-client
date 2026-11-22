@@ -17,6 +17,8 @@ pub enum AgentStreamEvent {
     TurnCompleted(TurnCompletedEvent),
     TurnFailed(TurnFailedEvent),
     TurnStarted(TurnStartedEvent),
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]

@@ -5,22 +5,32 @@ use std::{env, fmt};
 
 use url::Url;
 
+use crate::envelope::HelloAuth;
 use crate::error::EndpointError;
 use crate::offer::ConnectionOffer;
 
 pub const DEFAULT_SSH_DAEMON_PORT: u16 = 6767;
 
 #[derive(Clone, Eq, PartialEq)]
+enum Credential {
+    LocalCredential(String),
+    Password(String),
+}
+
+#[derive(Clone, Eq, PartialEq)]
 pub struct ConnectTarget {
     endpoint: Endpoint,
-    password: Option<String>,
+    credential: Option<Credential>,
 }
 
 impl fmt::Debug for ConnectTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ConnectTarget")
             .field("endpoint", &self.endpoint)
-            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field(
+                "credential",
+                &self.credential.as_ref().map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
@@ -29,7 +39,7 @@ impl ConnectTarget {
     pub fn new(endpoint: Endpoint) -> ConnectTarget {
         ConnectTarget {
             endpoint,
-            password: None,
+            credential: None,
         }
     }
 
@@ -38,16 +48,50 @@ impl ConnectTarget {
     }
 
     pub fn password(&self) -> Option<&str> {
-        self.password.as_deref()
+        match &self.credential {
+            Some(Credential::Password(password)) => Some(password),
+            Some(Credential::LocalCredential(_)) | None => None,
+        }
     }
 
     pub fn set_password(&mut self, password: Option<String>) {
-        self.password = password.filter(|password| !password.is_empty());
+        self.set_credential(password.map(Credential::Password));
     }
 
     pub fn with_password(mut self, password: Option<String>) -> ConnectTarget {
         self.set_password(password);
         self
+    }
+
+    pub fn local_credential(&self) -> Option<&str> {
+        match &self.credential {
+            Some(Credential::LocalCredential(token)) => Some(token),
+            Some(Credential::Password(_)) | None => None,
+        }
+    }
+
+    pub fn set_local_credential(&mut self, token: Option<String>) {
+        self.set_credential(token.map(Credential::LocalCredential));
+    }
+
+    pub fn with_local_credential(mut self, token: Option<String>) -> ConnectTarget {
+        self.set_local_credential(token);
+        self
+    }
+
+    pub(crate) fn hello_auth(&self) -> Option<HelloAuth<'_>> {
+        self.credential.as_ref().map(|credential| match credential {
+            Credential::LocalCredential(token) => HelloAuth::LocalCredential { token },
+            Credential::Password(password) => HelloAuth::Password { password },
+        })
+    }
+
+    fn set_credential(&mut self, credential: Option<Credential>) {
+        self.credential = credential.filter(|credential| match credential {
+            Credential::LocalCredential(secret) | Credential::Password(secret) => {
+                !secret.is_empty()
+            }
+        });
     }
 }
 
@@ -87,7 +131,7 @@ impl FromStr for ConnectTarget {
                 .with_password(query_value(&url, "password")));
         }
         if input.starts_with("ssh://") {
-            return Ok(ConnectTarget::new(Endpoint::Ssh(SshTarget::parse(input)?)));
+            return SshTarget::parse(input).map(|ssh| ConnectTarget::new(Endpoint::Ssh(ssh)));
         }
         if input.starts_with("tcp://") {
             let url = parse_url(input)?;
@@ -273,6 +317,14 @@ impl SshTarget {
         self.daemon_port
     }
 
+    #[cfg(not(feature = "ssh"))]
+    fn parse(input: &str) -> Result<SshTarget, EndpointError> {
+        Err(EndpointError::SshUnsupported {
+            input: input.to_owned(),
+        })
+    }
+
+    #[cfg(feature = "ssh")]
     fn parse(input: &str) -> Result<SshTarget, EndpointError> {
         let url = parse_url(input)?;
         let unsupported = |part: &str| EndpointError::UnsupportedPart {
@@ -325,6 +377,7 @@ impl SshTarget {
         })
     }
 
+    #[cfg(feature = "ssh")]
     pub(crate) fn tunnel_args(&self) -> Vec<String> {
         let mut args = [
             "-T",
@@ -353,6 +406,7 @@ impl SshTarget {
         args
     }
 
+    #[cfg(feature = "ssh")]
     pub(crate) fn ws_url(&self) -> String {
         format!("ws://127.0.0.1:{}/ws", self.daemon_port)
     }

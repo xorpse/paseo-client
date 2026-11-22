@@ -2,7 +2,6 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use crypto_box::aead::Aead;
 use crypto_box::{Nonce, PublicKey, SalsaBox, SecretKey};
-use serde::{Deserialize, Serialize};
 
 use crate::error::CryptoError;
 
@@ -11,29 +10,6 @@ const NONCE_LEN: usize = 24;
 pub(crate) struct Channel {
     sealed_box: SalsaBox,
     our_public: [u8; 32],
-}
-
-#[derive(Serialize)]
-struct Hello<'a> {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    key: &'a str,
-    capabilities: Capabilities,
-}
-
-#[derive(Default, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct Capabilities {
-    #[serde(default)]
-    pub(crate) binary_ciphertext: bool,
-}
-
-#[derive(Deserialize)]
-pub(crate) struct Ready {
-    #[serde(rename = "type")]
-    pub(crate) kind: String,
-    #[serde(default)]
-    pub(crate) capabilities: Capabilities,
 }
 
 impl Channel {
@@ -47,16 +23,8 @@ impl Channel {
         })
     }
 
-    pub(crate) fn hello_frame(&self) -> String {
-        let key = STANDARD.encode(self.our_public);
-        let hello = Hello {
-            kind: "e2ee_hello",
-            key: &key,
-            capabilities: Capabilities {
-                binary_ciphertext: true,
-            },
-        };
-        serde_json::to_string(&hello).expect("the e2ee hello serialises")
+    pub(crate) fn our_public(&self) -> &[u8; 32] {
+        &self.our_public
     }
 
     pub(crate) fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {

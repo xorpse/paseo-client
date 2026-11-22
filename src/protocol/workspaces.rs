@@ -3,9 +3,9 @@ use std::num::NonZeroU64;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ArgumentError;
-use crate::protocol::number::WireNumber;
-
 use crate::protocol::agents::{AgentSnapshot, Page, PageInfo, Sort, SortDirection};
+use crate::protocol::checkout::ForgeRuntime;
+use crate::protocol::number::WireNumber;
 use crate::protocol::timeline::WorktreeSetupDetail;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -14,6 +14,8 @@ pub enum ProjectKind {
     Directory,
     Git,
     NonGit,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -23,6 +25,8 @@ pub enum WorkspaceKind {
     Directory,
     LocalCheckout,
     Worktree,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -33,6 +37,8 @@ pub enum WorkspaceStatus {
     Failed,
     NeedsInput,
     Running,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
@@ -57,6 +63,8 @@ pub enum ScriptKind {
     Script,
     #[default]
     Service,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -64,6 +72,8 @@ pub enum ScriptKind {
 pub enum ScriptLifecycle {
     Running,
     Stopped,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -71,6 +81,8 @@ pub enum ScriptLifecycle {
 pub enum ScriptHealth {
     Healthy,
     Unhealthy,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -102,6 +114,14 @@ impl WorkspaceScript {
 
     pub fn kind(&self) -> ScriptKind {
         self.kind
+    }
+
+    pub fn is_service(&self) -> bool {
+        self.kind == ScriptKind::Service
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.lifecycle == ScriptLifecycle::Running
     }
 
     pub fn hostname(&self) -> &str {
@@ -330,8 +350,14 @@ pub struct ProjectDescriptor {
     project_display_name: String,
     #[serde(default)]
     project_custom_name: Option<String>,
+    #[serde(default)]
+    project_custom_icon_revision: Option<String>,
+    #[serde(default)]
+    project_icon_revision: Option<String>,
     project_root_path: String,
     project_kind: ProjectKind,
+    #[serde(default)]
+    sync_seq: Option<u64>,
 }
 
 impl ProjectDescriptor {
@@ -351,12 +377,24 @@ impl ProjectDescriptor {
         self.project_custom_name.as_deref()
     }
 
+    pub fn project_custom_icon_revision(&self) -> Option<&str> {
+        self.project_custom_icon_revision.as_deref()
+    }
+
+    pub fn project_icon_revision(&self) -> Option<&str> {
+        self.project_icon_revision.as_deref()
+    }
+
     pub fn project_root_path(&self) -> &str {
         &self.project_root_path
     }
 
     pub fn project_kind(&self) -> ProjectKind {
         self.project_kind
+    }
+
+    pub fn sync_seq(&self) -> Option<u64> {
+        self.sync_seq
     }
 }
 
@@ -368,9 +406,13 @@ pub struct WorkspaceDescriptor {
     project_display_name: String,
     #[serde(default)]
     project_custom_name: Option<String>,
+    #[serde(default)]
+    project_custom_icon_revision: Option<String>,
     project_root_path: String,
     #[serde(default)]
     workspace_directory: Option<String>,
+    #[serde(default)]
+    setup_status: Option<SetupStatus>,
     #[serde(default)]
     worktree_slug: Option<String>,
     project_kind: ProjectKind,
@@ -391,15 +433,23 @@ pub struct WorkspaceDescriptor {
     status_entered_at: Option<String>,
     activity_at: Option<String>,
     #[serde(default)]
+    created_at: Option<String>,
+    #[serde(default)]
+    last_user_message_at: Option<String>,
+    #[serde(default)]
     diff_stat: Option<DiffStat>,
     #[serde(default)]
     scripts: Vec<WorkspaceScript>,
     #[serde(default)]
     git_runtime: Option<WorkspaceGitRuntime>,
+    #[serde(default, rename = "githubRuntime")]
+    forge_runtime: Option<ForgeRuntime>,
     #[serde(default)]
     forge: Option<String>,
     #[serde(default)]
     project: Option<ProjectPlacement>,
+    #[serde(default)]
+    sync_seq: Option<u64>,
 }
 
 impl WorkspaceDescriptor {
@@ -423,8 +473,16 @@ impl WorkspaceDescriptor {
         &self.project_root_path
     }
 
+    pub fn project_custom_icon_revision(&self) -> Option<&str> {
+        self.project_custom_icon_revision.as_deref()
+    }
+
     pub fn workspace_directory(&self) -> Option<&str> {
         self.workspace_directory.as_deref()
+    }
+
+    pub fn setup_status(&self) -> Option<SetupStatus> {
+        self.setup_status
     }
 
     pub fn worktree_slug(&self) -> Option<&str> {
@@ -475,6 +533,14 @@ impl WorkspaceDescriptor {
         self.activity_at.as_deref()
     }
 
+    pub fn created_at(&self) -> Option<&str> {
+        self.created_at.as_deref()
+    }
+
+    pub fn last_user_message_at(&self) -> Option<&str> {
+        self.last_user_message_at.as_deref()
+    }
+
     pub fn diff_stat(&self) -> Option<DiffStat> {
         self.diff_stat
     }
@@ -483,8 +549,16 @@ impl WorkspaceDescriptor {
         &self.scripts
     }
 
+    pub fn set_scripts(&mut self, scripts: Vec<WorkspaceScript>) {
+        self.scripts = scripts;
+    }
+
     pub fn git_runtime(&self) -> Option<&WorkspaceGitRuntime> {
         self.git_runtime.as_ref()
+    }
+
+    pub fn forge_runtime(&self) -> Option<&ForgeRuntime> {
+        self.forge_runtime.as_ref()
     }
 
     pub fn forge(&self) -> Option<&str> {
@@ -493,6 +567,10 @@ impl WorkspaceDescriptor {
 
     pub fn project(&self) -> Option<&ProjectPlacement> {
         self.project.as_ref()
+    }
+
+    pub fn sync_seq(&self) -> Option<u64> {
+        self.sync_seq
     }
 
     pub fn directory(&self) -> &str {
@@ -534,6 +612,8 @@ impl WorkspaceDirectoryPage {
 pub enum WorkspaceUpdate {
     Remove(WorkspaceRemoval),
     Upsert(WorkspaceUpsert),
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -541,7 +621,7 @@ pub enum WorkspaceUpdate {
 pub struct WorkspaceRemoval {
     id: String,
     #[serde(default)]
-    empty_project: Option<ProjectDescriptor>,
+    empty_project: Option<Box<ProjectDescriptor>>,
     #[serde(default)]
     removed_project_id: Option<String>,
 }
@@ -552,7 +632,7 @@ impl WorkspaceRemoval {
     }
 
     pub fn empty_project(&self) -> Option<&ProjectDescriptor> {
-        self.empty_project.as_ref()
+        self.empty_project.as_deref()
     }
 
     pub fn removed_project_id(&self) -> Option<&str> {
@@ -576,6 +656,8 @@ impl WorkspaceUpsert {
 pub enum ProjectUpdate {
     Remove(ProjectRemoval),
     Upsert(ProjectUpsert),
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -625,6 +707,8 @@ pub enum SetupStatus {
     Completed,
     Failed,
     Running,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -788,6 +872,8 @@ pub struct WorktreeSource {
     #[serde(skip_serializing_if = "Option::is_none")]
     branch_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    checkout_source: Option<ChangeRequestCheckout>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     worktree_slug: Option<String>,
 }
 
@@ -880,6 +966,72 @@ impl WorktreeSource {
 
     pub fn with_worktree_slug(mut self, worktree_slug: impl Into<String>) -> WorktreeSource {
         self.set_worktree_slug(worktree_slug);
+        self
+    }
+
+    pub fn checkout_source(&self) -> Option<&ChangeRequestCheckout> {
+        self.checkout_source.as_ref()
+    }
+
+    pub fn set_checkout_source(&mut self, checkout_source: ChangeRequestCheckout) {
+        self.checkout_source = Some(checkout_source);
+    }
+
+    pub fn with_checkout_source(
+        mut self,
+        checkout_source: ChangeRequestCheckout,
+    ) -> WorktreeSource {
+        self.set_checkout_source(checkout_source);
+        self
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "kind", rename = "change_request", rename_all = "camelCase")]
+pub struct ChangeRequestCheckout {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    forge: Option<String>,
+    number: NonZeroU64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project_path: Option<String>,
+}
+
+impl ChangeRequestCheckout {
+    pub fn new(number: NonZeroU64) -> ChangeRequestCheckout {
+        ChangeRequestCheckout {
+            forge: None,
+            number,
+            project_path: None,
+        }
+    }
+
+    pub fn number(&self) -> NonZeroU64 {
+        self.number
+    }
+
+    pub fn forge(&self) -> Option<&str> {
+        self.forge.as_deref()
+    }
+
+    pub fn set_forge(&mut self, forge: impl Into<String>) {
+        self.forge = Some(forge.into());
+    }
+
+    pub fn with_forge(mut self, forge: impl Into<String>) -> ChangeRequestCheckout {
+        self.set_forge(forge);
+        self
+    }
+
+    pub fn project_path(&self) -> Option<&str> {
+        self.project_path.as_deref()
+    }
+
+    pub fn set_project_path(&mut self, project_path: impl Into<String>) {
+        self.project_path = Some(project_path.into());
+    }
+
+    pub fn with_project_path(mut self, project_path: impl Into<String>) -> ChangeRequestCheckout {
+        self.set_project_path(project_path);
         self
     }
 }
@@ -1139,11 +1291,13 @@ impl DirectorySuggestionsQuery {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntryKind {
     Directory,
     File,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -1159,5 +1313,124 @@ impl DirectorySuggestion {
 
     pub fn kind(&self) -> EntryKind {
         self.kind
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum WorkspaceRecovery {
+    Recoverable {
+        workspace_id: String,
+        workspace_name: String,
+        action: String,
+        branch: Option<String>,
+    },
+    Unavailable {
+        workspace_id: String,
+        reason: String,
+        message: String,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AttentionCleared {
+    workspace_id: String,
+    cleared_agent_ids: Vec<String>,
+    success: bool,
+    error: Option<String>,
+}
+
+impl AttentionCleared {
+    pub fn workspace_id(&self) -> &str {
+        &self.workspace_id
+    }
+
+    pub fn cleared_agent_ids(&self) -> &[String] {
+        &self.cleared_agent_ids
+    }
+
+    pub fn success(&self) -> bool {
+        self.success
+    }
+
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClosedAgent {
+    agent_id: String,
+    archived_at: String,
+}
+
+impl ClosedAgent {
+    pub fn agent_id(&self) -> &str {
+        &self.agent_id
+    }
+
+    pub fn archived_at(&self) -> &str {
+        &self.archived_at
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClosedTerminal {
+    terminal_id: String,
+    success: bool,
+}
+
+impl ClosedTerminal {
+    pub fn terminal_id(&self) -> &str {
+        &self.terminal_id
+    }
+
+    pub fn success(&self) -> bool {
+        self.success
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct ClosedItems {
+    agents: Vec<ClosedAgent>,
+    terminals: Vec<ClosedTerminal>,
+}
+
+impl ClosedItems {
+    pub fn agents(&self) -> &[ClosedAgent] {
+        &self.agents
+    }
+
+    pub fn terminals(&self) -> &[ClosedTerminal] {
+        &self.terminals
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectIcon {
+    mime_type: String,
+    bytes: Vec<u8>,
+}
+
+impl ProjectIcon {
+    pub(crate) fn new(mime_type: String, bytes: Vec<u8>) -> ProjectIcon {
+        ProjectIcon { mime_type, bytes }
+    }
+
+    pub fn mime_type(&self) -> &str {
+        &self.mime_type
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
     }
 }

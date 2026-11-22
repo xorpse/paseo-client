@@ -4,10 +4,15 @@ use async_tungstenite::tungstenite;
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::protocol::config::ProjectConfigError;
+use crate::protocol::diff::{CheckoutError, CheckoutErrorCode};
+
 #[derive(Debug, Error)]
 pub enum PaseoError {
     #[error("invalid argument: {0}")]
     Argument(#[from] ArgumentError),
+    #[error("{0}")]
+    Checkout(CheckoutRejection),
     #[error("connection closed")]
     Closed,
     #[error("crypto failure: {0}")]
@@ -56,6 +61,13 @@ impl PaseoError {
                 | PaseoError::Ssh { .. }
                 | PaseoError::WebSocket(_)
         )
+    }
+
+    pub(crate) fn checkout(request_type: &'static str, error: CheckoutError) -> PaseoError {
+        PaseoError::Checkout(CheckoutRejection {
+            request_type,
+            error,
+        })
     }
 
     pub(crate) fn decode(message_type: impl Into<String>, source: serde_json::Error) -> PaseoError {
@@ -119,6 +131,32 @@ impl fmt::Display for RpcError {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckoutRejection {
+    request_type: &'static str,
+    error: CheckoutError,
+}
+
+impl CheckoutRejection {
+    pub fn request_type(&self) -> &str {
+        self.request_type
+    }
+
+    pub fn code(&self) -> CheckoutErrorCode {
+        self.error.code()
+    }
+
+    pub fn message(&self) -> &str {
+        self.error.message()
+    }
+}
+
+impl fmt::Display for CheckoutRejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} failed: {}", self.request_type, self.error.message())
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum RequestFailure {
     #[error("the daemon declined the request")]
@@ -131,8 +169,12 @@ pub enum RequestFailure {
     NotADirectory { path: String },
     #[error("not found")]
     NotFound,
+    #[error("{0}")]
+    ProjectConfig(ProjectConfigError),
     #[error("the daemon replied with status {0:?}")]
     UnexpectedStatus(String),
+    #[error("the daemon replied with an outcome this client does not recognise")]
+    UnrecognisedOutcome,
 }
 
 #[derive(Debug, Error)]
@@ -184,14 +226,56 @@ pub enum CryptoError {
     Decrypt,
     #[error("encryption failed")]
     Encrypt,
+    #[error("frame is larger than a protected record can carry")]
+    FrameTooLarge,
     #[error("ciphertext shorter than its nonce")]
     FrameTooShort,
+    #[error("noise protocol failure: {0}")]
+    Noise(#[from] snow::Error),
+    #[error("noise nonce space exhausted")]
+    NonceExhausted,
     #[error("decrypted text frame is not UTF-8")]
     PlaintextUtf8,
+    #[error("daemon selected invalid protected session parameters")]
+    ProtectedParameters,
     #[error("daemon public key is not 32 bytes")]
     PublicKeyLength,
     #[error("random number generation failed: {0}")]
     Random(getrandom::Error),
+    #[error("malformed protected record: {0}")]
+    Record(#[from] RecordViolation),
+}
+
+#[derive(Debug, Error)]
+pub enum RecordViolation {
+    #[error("chunk after the final chunk")]
+    ChunkAfterFinal,
+    #[error("invalid chunk length")]
+    ChunkLength,
+    #[error("chunk size does not match the frame length")]
+    ChunkSize,
+    #[error("empty record")]
+    Empty,
+    #[error("final flag on the wrong chunk")]
+    FinalFlag,
+    #[error("first flag repeated inside a record")]
+    FirstRepeated,
+    #[error("record ended before its frame was complete")]
+    Incomplete,
+    #[error("invalid frame kind")]
+    Kind,
+    #[error("frame kind changed inside a record")]
+    KindChanged,
+    #[error("frame length changed inside a record")]
+    LengthChanged,
+    #[error("record length does not match its frame length")]
+    LengthMismatch,
+    #[error("record does not start with its first chunk")]
+    NotFirst,
+    #[error("reserved flag set")]
+    ReservedFlag,
+    #[error("record truncated")]
+    Truncated,
 }
 
 #[derive(Debug, Error)]
@@ -212,6 +296,8 @@ pub enum EndpointError {
     OfferIncomplete,
     #[error("invalid pairing offer JSON: {0}")]
     OfferJson(serde_json::Error),
+    #[error("{input:?} needs ssh, which this build does not include")]
+    SshUnsupported { input: String },
     #[error("invalid TLS server name {host:?}")]
     TlsServerName { host: String },
     #[error("unix socket endpoints are not supported on this platform")]
@@ -227,22 +313,40 @@ pub enum EndpointError {
     },
 }
 
+#[cfg(feature = "ssh")]
 #[derive(Debug, Error)]
 #[error("ssh tunnel closed: {detail}")]
 pub(crate) struct SshTunnelClosed {
     pub(crate) detail: String,
 }
 
+#[derive(Debug, Deserialize, Error)]
+#[error("host route closed ({code}): {message}")]
+pub(crate) struct HostRouteClosed {
+    code: String,
+    message: String,
+}
+
 #[derive(Debug, Error)]
 pub enum ProtocolViolation {
     #[error("connection closed before the handshake completed")]
     ClosedDuringHandshake,
+    #[error("file transfer ended after {received} of {expected} bytes")]
+    FileTransferIncomplete { expected: u64, received: u64 },
+    #[error("file transfer ended without its metadata")]
+    FileTransferWithoutBegin,
     #[error("git checkout status without {0}")]
     IncompleteCheckoutStatus(&'static str),
+    #[error("the daemon opened a host route with an invalid id")]
+    InvalidRouteId,
+    #[error("the relay session negotiated legacy security where protected security is required")]
+    LegacySecurityRefused,
     #[error("relay did not negotiate binary ciphertext frames")]
     MissingBinaryCiphertext,
     #[error("{response_type} carried no subscription id")]
     MissingSubscriptionId { response_type: &'static str },
     #[error("plaintext frame on an encrypted channel")]
     PlaintextOnEncryptedChannel,
+    #[error("unsupported protected handshake envelope version {version}")]
+    ProtectedEnvelopeVersion { version: u32 },
 }
