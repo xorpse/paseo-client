@@ -30,6 +30,7 @@ use crate::protocol::agents::{
     ModelDefinition, PermissionResponse, PromptPreview, ProviderNotice, RewindMode, SlashCommand,
     WaitOutcome,
 };
+use crate::protocol::bots::{BotAction, BotReply};
 use crate::protocol::channels::{NetClosed, ProcessExit, ProcessSpawn};
 use crate::protocol::checkout::{
     BranchSource, BranchValidation, CheckDetails, CheckDetailsQuery, CommitFile, CommitList,
@@ -218,6 +219,7 @@ impl Response for WorkspaceDirectoryPage {}
 impl Response for ProvidersSnapshot {}
 impl Response for ProviderInstallations {}
 impl Response for ProviderSetup {}
+impl Response for BotReply {}
 impl Response for TerminalsChanged {}
 impl Response for TerminalSlot {}
 impl Response for DaemonStatus {}
@@ -3983,6 +3985,16 @@ impl PaseoClient {
         let rpc = Rpc::new("shutdown_server_request", "status");
         let response = self.call::<_, ServerStatusReply>(rpc, &NoFields {}).await?;
         response.confirm(rpc, ServerStatus::ShutdownRequested)
+    }
+
+    pub async fn bots(&self, action: &BotAction) -> Result<BotReply, PaseoError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            action: &'a BotAction,
+        }
+        self.require(DaemonFeature::Bots)?;
+        self.call(Rpc::new("bots.request", "bots.response"), &Body { action })
+            .await
     }
 
     pub async fn start_provider_setup(
